@@ -1,0 +1,43 @@
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    branches:
+      - 'main'
+  schedule:
+    - cron: "9 3 * * *"
+
+name: "Test and Update CVE Records"
+
+permissions:
+  contents: read
+
+jobs:
+  test_and_update_cve_records:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: CVE RSUS check and upload
+        uses: DIVD-NL/cna-bot@6a7675ec15c3c2bda206cceef69fc0e92bde4a28 # v1.5.1
+        with: 
+          cve-user: ${{ secrets.CVE_USER }}
+          cve-org: ${{ secrets.CVE_ORG }}
+          cve-api-key: ${{ secrets.CVE_API_KEY }}
+          cve-environment: test
+          publish: ${{ github.ref == 'refs/heads/main' }}
+          path: records
+          reservations-path : records/reservations
+          min-reserved: 2
+          reserve: 2
+          pr: ${{ github.event_name != 'pull_request' }}
+          # Created by @maennchen
+          # Valid until March 27th 2026
+          # Scopes:
+          # - Specifc Repository (cna)
+          # - Orga: Administration Read
+          # - Read Contents
+          # - Read and Write to Pull Requests
+          github-token: ${{ secrets.CNA_BOT_GITHUB_TOKEN }}          
+          expire-after: "1y"
