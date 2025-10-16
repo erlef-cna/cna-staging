@@ -1,0 +1,28 @@
+on:
+  push:
+    paths:
+      - '.github/workflows/osv_sync.yml'
+      - 'records/**/*.json'
+      - '!records/reservations/*.json'
+      - 'osv/*.json'
+      - 'scripts/cve-to-osv'
+
+name: "OSV Sync Check"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: "Check OSV Files"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Elixir
+        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
+        with:
+          elixir-version: '1.18.4'
+          otp-version: '27.3.4.1'
+      - name: Check OSV files are up to date
+        run: './scripts/cve-to-osv check-all'
