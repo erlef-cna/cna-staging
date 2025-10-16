@@ -42,7 +42,12 @@ jobs:
             -path 'records/reservations' -prune \
           -or \
             -type f -name '*.json' \
-            -exec cp -f {} website/_data/cves-staging/ \;
+            -exec cp -f {} website/_data/cves-staging/ \; && \
+          mkdir -p \
+            website/_data/osv-staging && \
+          find osv \
+            -type f -name '*.json' \
+            -exec cp -f {} website/_data/osv-staging/ \;
       - name: Create or update CVE-data PR
         id: cpr
         uses: peter-evans/create-pull-request@v7
