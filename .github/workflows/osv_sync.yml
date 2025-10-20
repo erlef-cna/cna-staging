@@ -41,67 +41,9 @@ jobs:
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
-      - name: Find changed CVE files in push
-        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47.0.0
-        id: changed-files
-        with:
-          files: |
-            records/**/*.json
-          files_ignore: |
-            records/reservations/*.json
-      - name: Check if conversion script changed
-        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47.0.0
-        id: script-changed
-        with:
-          files: |
-            scripts/cve-to-osv
-            .github/workflows/osv_sync.yml
-      - name: Convert changed CVE files to OSV format
-        if: steps.changed-files.outputs.any_changed == 'true' && steps.script-changed.outputs.any_changed == 'false'
-        env:
-          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
-        run: |
-          echo "Converting changed CVE files to OSV format..."
-
-          # Convert space-separated files into array and pass all at once
-          files_array=($CHANGED_FILES)
-          if [ ${#files_array[@]} -gt 0 ]; then
-            echo "Converting ${#files_array[@]} files: ${files_array[*]}"
-            ./scripts/cve-to-osv convert "${files_array[@]}" || {
-              echo "Warning: Failed to convert files, stopping..."
-              exit 1
-            }
-          fi
-      - name: Convert all CVE files to OSV format (script changed)
-        if: steps.script-changed.outputs.any_changed == 'true'
-        run: |
-          echo "Conversion script changed, regenerating all OSV files..."
-
-          # Find all CVE files and convert them all at once
-          all_files=($(find records -name "*.json" -not -path "records/reservations/*"))
-          echo "Converting ${#all_files[@]} files: ${all_files[*]}"
-          ./scripts/cve-to-osv convert "${all_files[@]}" || {
-            echo "Warning: Failed to convert files, stopping..."
-            exit 1
-          }
-      - name: Check if OSV files were modified
-        id: osv-changes
-        run: |
-          # Add new files to staging to detect them in diff
-          git add osv/
-
-          if git diff --quiet --cached osv/ && git diff --quiet osv/; then
-            echo "No OSV changes detected"
-            echo "osv_changed=false" >> $GITHUB_OUTPUT
-          else
-            echo "OSV files were modified or added"
-            echo "osv_changed=true" >> $GITHUB_OUTPUT
-            # Show what changed
-            git diff --stat --cached osv/
-            git diff --stat osv/
-          fi
+      - name: Convert all CVE files to OSV format
+        run: './scripts/cve-to-osv convert-all'
       - name: Create or update PR
-        if: steps.osv-changes.outputs.osv_changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -147,21 +89,7 @@ jobs:
       - name: Update OSV versions
         run: './scripts/cve-to-osv update-versions'
 
-      - name: Check for changes
-        id: check_changes
-        run: |
-          if git diff --quiet osv/; then
-            echo "No changes detected"
-            echo "changes=false" >> $GITHUB_OUTPUT
-          else
-            echo "Changes detected in OSV files"
-            echo "changes=true" >> $GITHUB_OUTPUT
-            # Show what changed
-            git diff --stat osv/
-          fi
-
       - name: Create or update PR
-        if: steps.check_changes.outputs.changes == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ steps.osv-app-token.outputs.token }}
