@@ -1,43 +1,30 @@
 on:
   push:
+    branches:
+      - main
     paths:
       - '.github/workflows/osv_sync.yml'
       - 'records/**/*.json'
       - '!records/reservations/*.json'
       - 'osv/*.json'
       - 'scripts/cve-to-osv'
-  pull_request:
-    paths:
-      - 'records/**/*.json'
-      - '!records/reservations/*.json'
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual trigger
 
-name: "OSV Sync Check"
+name: "OSV Auto Sync"
 
 permissions:
   contents: read
 
 jobs:
-  check:
-    name: "Check OSV Files"
+  auto_update:
+    name: "Auto-Update OSV Files for Main Branch"
     runs-on: ubuntu-latest
-    if: "!(github.event_name == 'pull_request' && startsWith(github.head_ref, 'cve_submit_pr_'))"
+    if: github.event_name == 'push'
     steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install Elixir
-        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
-        with:
-          elixir-version: '1.18.4'
-          otp-version: '27.3.4.1'
-      - name: Check OSV files are up to date
-        run: './scripts/cve-to-osv check-all'
-
-  update:
-    name: "Update OSV Files for Bot PR"
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'cve_submit_pr_')
-    steps:
-      - name: Login for bot PR updates
+      - name: Login for auto updates
         uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
         id: app-token
         with:
@@ -54,7 +41,7 @@ jobs:
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
-      - name: Find changed CVE files in bot PR
+      - name: Find changed CVE files in push
         uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47.0.0
         id: changed-files
         with:
@@ -62,14 +49,34 @@ jobs:
             records/**/*.json
           files_ignore: |
             records/reservations/*.json
+      - name: Check if conversion script changed
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47.0.0
+        id: script-changed
+        with:
+          files: |
+            scripts/cve-to-osv
       - name: Convert changed CVE files to OSV format
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: steps.changed-files.outputs.any_changed == 'true' && steps.script-changed.outputs.any_changed == 'false'
         env:
           CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
           echo "Converting changed CVE files to OSV format..."
 
-          echo "$CHANGED_FILES" | while IFS= read -r file; do
+          # Convert space-separated files into array and pass all at once
+          files_array=($CHANGED_FILES)
+          if [ ${#files_array[@]} -gt 0 ]; then
+            echo "Converting ${#files_array[@]} files: ${files_array[*]}"
+            ./scripts/cve-to-osv convert "${files_array[@]}" || {
+              echo "Warning: Failed to convert files, stopping..."
+              exit 1
+            }
+          fi
+      - name: Convert all CVE files to OSV format (script changed)
+        if: steps.script-changed.outputs.any_changed == 'true'
+        run: |
+          echo "Conversion script changed, regenerating all OSV files..."
+
+          find records -name "*.json" -not -path "records/reservations/*" | while IFS= read -r file; do
             if [ -n "$file" ] && [ -f "$file" ]; then
               echo "Converting: $file"
               ./scripts/cve-to-osv convert "$file" || {
@@ -78,11 +85,10 @@ jobs:
               }
             fi
           done
-      - name: Commit OSV updates
-        if: steps.changed-files.outputs.any_changed == 'true'
+      - name: Commit OSV updates to main
+        if: steps.changed-files.outputs.any_changed == 'true' || steps.script-changed.outputs.any_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_BRANCH: ${{ github.head_ref }}
         run: |
           # Configure git with bot identity
           git config --global user.name "eef-cna-bot[bot]"
@@ -95,9 +101,70 @@ jobs:
           if [ -d "osv/" ] && ! git diff --quiet osv/; then
             echo "OSV files were updated, committing changes..."
             git add osv/
-            git commit -m "Update OSV files for CVE changes"
-            git push origin "HEAD:$TARGET_BRANCH"
-            echo "Successfully pushed OSV updates"
+            git commit -m "Update OSV files for CVE changes
+
+            This automated update converts CVE records to OSV format
+            following changes to CVE files in the main branch."
+            git push origin main
+            echo "Successfully pushed OSV updates to main"
           else
             echo "No OSV files were changed, nothing to commit"
           fi
+
+  update_versions:
+    name: "Update OSV Affected Versions"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Login for version updates
+        uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
+        id: osv-app-token
+        with:
+          app-id: ${{ vars.CNA_BOT_APP_ID }}
+          private-key: ${{ secrets.CNA_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          token: ${{ steps.osv-app-token.outputs.token }}
+
+      - name: Install Elixir
+        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
+        with:
+          elixir-version: '1.18.4'
+          otp-version: '27.3.4.1'
+
+      - name: Update OSV versions
+        run: './scripts/cve-to-osv update-versions'
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet osv/; then
+            echo "No changes detected"
+            echo "changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected in OSV files"
+            echo "changes=true" >> $GITHUB_OUTPUT
+            # Show what changed
+            git diff --stat osv/
+          fi
+
+      - name: Commit and push OSV version updates
+        if: steps.check_changes.outputs.changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ steps.osv-app-token.outputs.token }}
+        run: |
+          # Configure git with bot identity
+          git config --global user.name "eef-cna-bot[bot]"
+          git config --global user.email "1194943+eef-cna-bot[bot]@users.noreply.github.com"
+
+          # Commit and push changes
+          git add osv/
+          git commit -m "chore(osv): update affected package versions
+
+          This automated update ensures OSV files contain all affected versions
+          based on the latest package versions from hex.pm."
+          git push origin main
