@@ -6,6 +6,7 @@ on:
       - '.github/workflows/publish_website.yml'
       - 'records/**/*.json'
       - '!records/reservations/*.json'
+      - 'osv/*.json'
 
 name: "Website Update"
 
