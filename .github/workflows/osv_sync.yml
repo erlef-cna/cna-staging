@@ -55,6 +55,7 @@ jobs:
         with:
           files: |
             scripts/cve-to-osv
+            .github/workflows/osv_sync.yml
       - name: Convert changed CVE files to OSV format
         if: steps.changed-files.outputs.any_changed == 'true' && steps.script-changed.outputs.any_changed == 'false'
         env:
@@ -85,8 +86,24 @@ jobs:
               }
             fi
           done
+      - name: Check if OSV files were modified
+        id: osv-changes
+        run: |
+          # Add new files to staging to detect them in diff
+          git add osv/
+
+          if git diff --quiet --cached osv/ && git diff --quiet osv/; then
+            echo "No OSV changes detected"
+            echo "osv_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "OSV files were modified or added"
+            echo "osv_changed=true" >> $GITHUB_OUTPUT
+            # Show what changed
+            git diff --stat --cached osv/
+            git diff --stat osv/
+          fi
       - name: Commit OSV updates to main
-        if: steps.changed-files.outputs.any_changed == 'true' || steps.script-changed.outputs.any_changed == 'true'
+        if: steps.osv-changes.outputs.osv_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -94,22 +111,14 @@ jobs:
           git config --global user.name "eef-cna-bot[bot]"
           git config --global user.email "1194943+eef-cna-bot[bot]@users.noreply.github.com"
 
-          # Ensure osv directory exists
-          mkdir -p osv/
+          # Commit changes (files are already staged from previous step)
+          echo "OSV files were updated, committing changes..."
+          git commit -m "Update OSV files for CVE changes
 
-          # Check if there are any changes to commit
-          if [ -d "osv/" ] && ! git diff --quiet osv/; then
-            echo "OSV files were updated, committing changes..."
-            git add osv/
-            git commit -m "Update OSV files for CVE changes
-
-            This automated update converts CVE records to OSV format
-            following changes to CVE files in the main branch."
-            git push origin main
-            echo "Successfully pushed OSV updates to main"
-          else
-            echo "No OSV files were changed, nothing to commit"
-          fi
+          This automated update converts CVE records to OSV format
+          following changes to CVE files in the main branch."
+          git push origin main
+          echo "Successfully pushed OSV updates to main"
 
   update_versions:
     name: "Update OSV Affected Versions"
