@@ -55,6 +55,7 @@ jobs:
         with:
           files: |
             scripts/cve-to-osv
+            .github/workflows/osv_sync.yml
       - name: Convert changed CVE files to OSV format
         if: steps.changed-files.outputs.any_changed == 'true' && steps.script-changed.outputs.any_changed == 'false'
         env:
@@ -76,40 +77,47 @@ jobs:
         run: |
           echo "Conversion script changed, regenerating all OSV files..."
 
-          find records -name "*.json" -not -path "records/reservations/*" | while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
-              echo "Converting: $file"
-              ./scripts/cve-to-osv convert "$file" || {
-                echo "Warning: Failed to convert $file, stopping..."
-                exit 1
-              }
-            fi
-          done
-      - name: Commit OSV updates to main
-        if: steps.changed-files.outputs.any_changed == 'true' || steps.script-changed.outputs.any_changed == 'true'
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Find all CVE files and convert them all at once
+          all_files=($(find records -name "*.json" -not -path "records/reservations/*"))
+          echo "Converting ${#all_files[@]} files: ${all_files[*]}"
+          ./scripts/cve-to-osv convert "${all_files[@]}" || {
+            echo "Warning: Failed to convert files, stopping..."
+            exit 1
+          }
+      - name: Check if OSV files were modified
+        id: osv-changes
         run: |
-          # Configure git with bot identity
-          git config --global user.name "eef-cna-bot[bot]"
-          git config --global user.email "1194943+eef-cna-bot[bot]@users.noreply.github.com"
+          # Add new files to staging to detect them in diff
+          git add osv/
 
-          # Ensure osv directory exists
-          mkdir -p osv/
-
-          # Check if there are any changes to commit
-          if [ -d "osv/" ] && ! git diff --quiet osv/; then
-            echo "OSV files were updated, committing changes..."
-            git add osv/
-            git commit -m "Update OSV files for CVE changes
-
-            This automated update converts CVE records to OSV format
-            following changes to CVE files in the main branch."
-            git push origin main
-            echo "Successfully pushed OSV updates to main"
+          if git diff --quiet --cached osv/ && git diff --quiet osv/; then
+            echo "No OSV changes detected"
+            echo "osv_changed=false" >> $GITHUB_OUTPUT
           else
-            echo "No OSV files were changed, nothing to commit"
+            echo "OSV files were modified or added"
+            echo "osv_changed=true" >> $GITHUB_OUTPUT
+            # Show what changed
+            git diff --stat --cached osv/
+            git diff --stat osv/
           fi
+      - name: Create or update PR
+        if: steps.osv-changes.outputs.osv_changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          commit-message: "Update OSV files for CVE changes"
+          title: "Update OSV files for CVE changes"
+          body: |
+            This PR updates OSV files following changes to CVE records or the conversion script.
+
+            This automated update converts CVE records to OSV format to keep OSV files synchronized with the latest CVE data.
+
+            Changes in this PR:
+            - Updated OSV files to reflect the latest CVE record changes
+          labels: automated, osv-update
+          branch: osv-cve-updates
+          delete-branch: true
+          base: main
 
   update_versions:
     name: "Update OSV Affected Versions"
@@ -152,19 +160,21 @@ jobs:
             git diff --stat osv/
           fi
 
-      - name: Commit and push OSV version updates
+      - name: Create or update PR
         if: steps.check_changes.outputs.changes == 'true'
-        env:
-          GITHUB_TOKEN: ${{ steps.osv-app-token.outputs.token }}
-        run: |
-          # Configure git with bot identity
-          git config --global user.name "eef-cna-bot[bot]"
-          git config --global user.email "1194943+eef-cna-bot[bot]@users.noreply.github.com"
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.osv-app-token.outputs.token }}
+          commit-message: "chore(osv): update affected package versions"
+          title: "Update OSV affected package versions"
+          body: |
+            This PR updates the affected versions in OSV files based on the latest package versions from hex.pm.
 
-          # Commit and push changes
-          git add osv/
-          git commit -m "chore(osv): update affected package versions
+            This is an automated update that runs daily to ensure OSV files contain all affected versions.
 
-          This automated update ensures OSV files contain all affected versions
-          based on the latest package versions from hex.pm."
-          git push origin main
+            Changes in this PR:
+            - Updated `versions` arrays in OSV files with newly published hex packages that are affected by the vulnerabilities
+          labels: automated, osv-update
+          branch: osv-version-updates
+          delete-branch: true
+          base: main
