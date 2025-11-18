@@ -26,7 +26,7 @@ jobs:
           app-id: ${{ vars.CNA_BOT_APP_ID }}
           private-key: ${{ secrets.CNA_BOT_PRIVATE_KEY }}
       - name: CVE RSUS check and upload
-        uses: DIVD-NL/cna-bot@b5de4f2931cfbfab5c19f901e363d80efdf1fbed # v1.6.0
+        uses: DIVD-NL/cna-bot@32b2dcdec099a157714ba9963572d22c62f70934 # v1.7.0
         with: 
           cve-user: ${{ secrets.CVE_USER }}
           cve-org: ${{ secrets.CVE_ORG }}
