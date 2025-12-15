@@ -51,7 +51,7 @@ jobs:
             -exec cp -f {} website/_data/osv-staging/ \;
       - name: Create or update CVE-data PR
         id: cpr
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           path: website
           token: ${{ steps.website-app-token.outputs.token }}

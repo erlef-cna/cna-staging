@@ -44,7 +44,7 @@ jobs:
       - name: Convert all CVE files to OSV format
         run: './scripts/cve-to-osv convert-all'
       - name: Create or update PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ steps.app-token.outputs.token }}
           commit-message: "Update OSV files for CVE changes"
@@ -90,7 +90,7 @@ jobs:
         run: './scripts/cve-to-osv update-versions'
 
       - name: Create or update PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ steps.osv-app-token.outputs.token }}
           commit-message: "chore(osv): update affected package versions"
