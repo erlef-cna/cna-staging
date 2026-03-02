@@ -37,7 +37,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
       - name: Install Elixir
-        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
+        uses: erlef/setup-beam@3580539ceec3dc05b0ed51e9e10b08eb7a7c2bb4 # v1.21.0
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
@@ -81,7 +81,7 @@ jobs:
           token: ${{ steps.osv-app-token.outputs.token }}
 
       - name: Install Elixir
-        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
+        uses: erlef/setup-beam@3580539ceec3dc05b0ed51e9e10b08eb7a7c2bb4 # v1.21.0
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
