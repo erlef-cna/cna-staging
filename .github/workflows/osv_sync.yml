@@ -25,7 +25,7 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - name: Login for auto updates
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: app-token
         with:
           app-id: ${{ vars.CNA_BOT_APP_ID }}
@@ -37,7 +37,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
       - name: Install Elixir
-        uses: erlef/setup-beam@3580539ceec3dc05b0ed51e9e10b08eb7a7c2bb4 # v1.21.0
+        uses: erlef/setup-beam@ee09b1e59bb240681c382eb1f0abc6a04af72764 # v1.23.0
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
@@ -67,7 +67,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Login for version updates
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         id: osv-app-token
         with:
           app-id: ${{ vars.CNA_BOT_APP_ID }}
@@ -81,7 +81,7 @@ jobs:
           token: ${{ steps.osv-app-token.outputs.token }}
 
       - name: Install Elixir
-        uses: erlef/setup-beam@3580539ceec3dc05b0ed51e9e10b08eb7a7c2bb4 # v1.21.0
+        uses: erlef/setup-beam@ee09b1e59bb240681c382eb1f0abc6a04af72764 # v1.23.0
         with:
           elixir-version: '1.18.4'
           otp-version: '27.3.4.1'
