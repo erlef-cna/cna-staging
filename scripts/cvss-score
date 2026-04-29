@@ -1,0 +1,40 @@
+#!/usr/bin/env elixir
+
+Mix.install([
+  {:cvss, "~> 0.1"}
+])
+
+defmodule CLI do
+  def run([vector]) do
+    score = :cvss.score(vector)
+    rating = :cvss.rating(vector)
+
+    IO.puts("Score:    #{score}")
+    IO.puts("Severity: #{format_rating(rating)}")
+  rescue
+    e ->
+      IO.puts(:stderr, "Error: #{Exception.message(e)}")
+      System.halt(1)
+  end
+
+  def run(_argv) do
+    script_path = :escript.script_name() |> List.to_string()
+
+    IO.puts("""
+    Usage: #{script_path} <vector>
+
+    Example:
+      #{script_path} "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    """)
+
+    System.halt(1)
+  end
+
+  defp format_rating(:critical), do: "CRITICAL"
+  defp format_rating(:high), do: "HIGH"
+  defp format_rating(:medium), do: "MEDIUM"
+  defp format_rating(:low), do: "LOW"
+  defp format_rating(:none), do: "NONE"
+end
+
+CLI.run(System.argv())
