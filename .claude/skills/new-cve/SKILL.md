@@ -58,17 +58,12 @@ Present your assessment and proposed changes. **Wait for user confirmation befor
 Use that ID directly.
 
 ### If no CVE ID is assigned yet:
-1. List available reservations for the current year:
+1. Run the helper script to find the next free reservation:
    ```bash
-   ls records/reservations/CVE-<current-year>-*.json
+   scripts/next-free-cve
    ```
-2. Check which reservations are already claimed by open PRs:
-   ```bash
-   gh pr list --json number,title,headRefName
-   ```
-   A reservation is in use if a PR's branch name contains the CVE number (e.g. `jm/CVE-2026-32685`).
-3. Pick the lowest available reservation not claimed by any open PR.
-4. Tell the user which number you are using and confirm before writing any files.
+   This checks all `RESERVED` reservations for the current year and excludes any already claimed by open PRs. It prints the lowest free CVE ID, or exits with an error if none are available.
+2. Tell the user which number you are using and confirm before writing any files.
 
 ## Step 5 — Write the CVE record
 
@@ -88,9 +83,9 @@ Key things to get right:
 - `source.discovery`: `EXTERNAL` for third-party reporters, `INTERNAL` for team-found, `UNKNOWN` if unclear
 - CVSS from Step 2 — `baseScore` and `baseSeverity` must be filled with real values from `scripts/cvss-score`, never left as `0.0`/`"UNKNOWN"`
 - For the introducing commit SHA: **always use the `/find-intro-commit` skill** — never attempt to find it manually or guess
-- For `versionType: "git"` entries, always use the actual commit SHA — never the tag SHA. Get commit SHAs with `git rev-parse <tag>^{}`
+- For `versionType: "git"` entries, always use the actual commit SHA — never the tag SHA. The introducing `version` comes from `/find-intro-commit` (a commit that predates any release tag). The `lessThan` fix SHA comes from the patch commit, not from `git rev-parse <tag>^{}`.
 - Only use `changes` in a version entry when there are multiple fix points (e.g. backported patches across release lines). For a single fix, express it with `lessThan` pointing to the fix version.
-- If there is no patched version yet, use `"TODO"` as the placeholder in version entries, `cpeApplicability`, and patch reference URLs
+- If there is no patched version yet, use `"TODO"` as the placeholder in version entries, `cpeApplicability`, patch reference URLs, and in the description text (e.g. "from 0.6.0 before TODO")
 - Do not include `x_generator` — CVEs are filed manually, not via Vulnogram
 
 After writing the file, run:

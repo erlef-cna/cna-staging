@@ -63,23 +63,15 @@ Only set non-None if the vulnerability meaningfully impacts systems beyond the v
 | L — Low | Some loss, but the attacker does not have full control over what is accessed or modified / performance is reduced but service not fully denied. |
 | N — None | No loss within the Subsequent System, or all impact is constrained to the Vulnerable System. |
 
-### Supplemental (optional, do not affect score)
-| Metric | Values |
-|--------|--------|
-| Safety (S) | N=Negligible, P=Present |
-| Automatable (AU) | N=No, Y=Yes |
-| Recovery (R) | A=Automatic, U=User, I=Irrecoverable |
-| Value Density (V) | D=Diffuse, C=Concentrated |
-| Vulnerability Response Effort (RE) | L=Low, M=Moderate, H=High |
-| Provider Urgency (U) | Clear, Green, Amber, Red |
+### Supplemental metrics (do NOT set)
+We only score the Base metrics. Do not set `Automatable`, `Recovery`, `Safety`, `valueDensity`, `vulnerabilityResponseEffort`, or `providerUrgency`. Leave them out of the JSON entirely.
 
 ## Steps
 
 1. Read the CVE record to understand the vulnerability.
 2. For each Base metric, choose the value and state a one-sentence rationale.
 3. Assess Subsequent System Impact — only non-None if there is meaningful impact beyond the vulnerable component.
-4. Consider Supplemental metrics if they add useful context.
-5. Produce the vector string in the form:
+4. Produce the vector string in the form:
    `CVSS:4.0/AV:_/AC:_/AT:_/PR:_/UI:_/VC:_/VI:_/VA:_/SC:_/SI:_/SA:_`
 6. Run `scripts/cvss-score "<vector>"` to get the real numeric score and severity rating.
    Example: `scripts/cvss-score "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"`

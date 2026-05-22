@@ -1,0 +1,98 @@
+#!/usr/bin/env elixir
+
+Mix.install([
+  {:jason, "~> 1.4"}
+])
+
+defmodule NextFreeCVE do
+  @records_base_path Path.expand("../records", __DIR__)
+  @reservations_path Path.expand("reservations", @records_base_path)
+
+  def run do
+    year = Date.utc_today().year |> Integer.to_string()
+
+    reserved = reserved_ids(year)
+    claimed = claimed_ids_in_prs(year)
+    free = MapSet.difference(reserved, claimed)
+
+    case Enum.min_by(MapSet.to_list(free), &numeric_part/1, fn -> nil end) do
+      nil ->
+        IO.puts(:stderr, """
+        No free CVE IDs for #{year}.
+
+        Reserved: #{Enum.join(Enum.sort(reserved), ", ")}
+        Claimed in PRs: #{Enum.join(Enum.sort(claimed), ", ")}
+        """)
+
+        System.halt(1)
+
+      id ->
+        IO.puts(id)
+    end
+  end
+
+  # IDs with state "RESERVED" in the reservations directory for the given year
+  defp reserved_ids(year) do
+    @reservations_path
+    |> Path.join("CVE-#{year}-*.json")
+    |> Path.wildcard()
+    |> Enum.filter(fn path ->
+      path |> File.read!() |> Jason.decode!() |> Map.fetch!("state") == "RESERVED"
+    end)
+    |> Enum.map(&cve_id_from_path/1)
+    |> MapSet.new()
+  end
+
+  # IDs touched by open PRs (extracted from changed file paths)
+  defp claimed_ids_in_prs(year) do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "list",
+        "--repo", repo(),
+        "--state", "open",
+        "--json", "number"
+      ])
+
+    pr_numbers =
+      output
+      |> Jason.decode!()
+      |> Enum.map(& &1["number"])
+
+    pr_numbers
+    |> Task.async_stream(&pr_cve_ids(&1, year), timeout: 30_000)
+    |> Enum.flat_map(fn {:ok, ids} -> ids end)
+    |> MapSet.new()
+  end
+
+  defp pr_cve_ids(pr_number, year) do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "view", Integer.to_string(pr_number),
+        "--repo", repo(),
+        "--json", "files"
+      ])
+
+    output
+    |> Jason.decode!()
+    |> Map.fetch!("files")
+    |> Enum.map(& &1["path"])
+    |> Enum.filter(&String.contains?(&1, "CVE-#{year}-"))
+    |> Enum.map(&cve_id_from_path/1)
+  end
+
+  defp cve_id_from_path(path) do
+    path
+    |> Path.basename(".json")
+  end
+
+  defp numeric_part("CVE-" <> rest) do
+    rest |> String.split("-") |> List.last() |> String.to_integer()
+  end
+
+  defp repo do
+    {output, 0} = System.cmd("gh", ["repo", "view", "--json", "nameWithOwner"])
+    output |> Jason.decode!() |> Map.fetch!("nameWithOwner")
+  end
+end
+
+NextFreeCVE.run()

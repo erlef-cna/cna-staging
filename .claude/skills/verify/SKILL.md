@@ -38,18 +38,18 @@ Fix any lint errors before proceeding.
 Read the CVE record and verify each item below. Report PASS/FAIL for each.
 
 ### Metadata
-- [ ] `cveMetadata` contains only: `assignerOrgId`, `assignerShortName`, `cveId`, `state`
+- [ ] `cveMetadata` contains `assignerOrgId`, `assignerShortName`, `cveId`, and `state` — date fields (`datePublished`, `dateReserved`, `dateRejected`, `dateUpdated`) are set externally and are fine if present; do not remove them
 - [ ] `cveMetadata.state` is `"PUBLISHED"`
-- [ ] No date fields in `cveMetadata` (`datePublished`, `dateReserved`, `dateRejected`, `dateUpdated`)
 
 ### programRoutines
 - [ ] All `programRoutines` use Erlang notation `module:function/arity` — Elixir modules use the `'Elixir.ModuleName'` atom prefix (e.g. `'Elixir.Decimal':add/2`), not Elixir dot notation (`Decimal.add/2`)
-- [ ] No `x_generator` field present (CVEs are filed manually, not via Vulnogram)
+- [ ] No `x_generator` field present — it may appear in records that were published and then fetched back; ignore it if present, do not remove it
 
 ### Descriptions
 - [ ] Plain text description (`value`) is present
 - [ ] HTML description (`supportingMedia` with `type: "text/html"`) is present
 - [ ] HTML uses `<tt>` for code/paths and `<p>` for paragraphs
+- [ ] The "This issue affects …" sentence ends with a real version number, not `TODO` — if the fix version is not yet known, use `before TODO` as a placeholder (e.g. `from 1.2.3 before TODO`)
 
 ### Affected Entries
 - [ ] No version entry uses `versionType: "purl"`
@@ -104,6 +104,7 @@ Detect the CVE type from the `packageURL` of the first affected entry and apply 
 - [ ] Second reference: `https://cna.erlef.org/cves/CVE-<num>.html` with tag `["related"]` (add `"third-party-advisory"` if no vendor advisory)
 - [ ] Third reference: `https://osv.dev/vulnerability/EEF-CVE-<num>` with tag `["related"]`
 - [ ] For OTP CVEs: `https://www.erlang.org/doc/system/versions.html#order-of-versions` with tag `["x_version-scheme"]` present
+- [ ] At least one reference with tag `"patch"` is present — if the patch commit is not yet known, use a placeholder URL ending in `/TODO` (e.g. `https://github.com/<owner>/<repo>/commit/TODO`). The only exception is CVEs being published intentionally without a patch; if no patch reference is present at all, confirm with the user before proceeding.
 
 ### CVSS
 - [ ] `baseScore` is not `0.0` (dummy value left unfilled)

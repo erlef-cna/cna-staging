@@ -40,3 +40,6 @@ jobs:
           pr: ${{ github.event_name != 'pull_request' }}
           github-token: ${{ steps.app-token.outputs.token }}
           expire-after: "1y"
+          # We also allow 3rd party advisories in case of unresponsive hex.pm
+          # package maintainers
+          ignore: "vendor-advisory"
