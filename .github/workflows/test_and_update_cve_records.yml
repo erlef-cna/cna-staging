@@ -58,6 +58,8 @@ jobs:
           # We also allow 3rd party advisories in case of unresponsive hex.pm
           # package maintainers
           ignore: "vendor-advisory"
+          # Count Locked CVEs against min-reserved
+          exclude-locked: true
       - name: Convert all CVE files to OSV format
         if: github.ref == 'refs/heads/main'
         run: './scripts/cve-to-osv convert-all'
