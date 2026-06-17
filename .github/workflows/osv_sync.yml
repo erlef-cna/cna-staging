@@ -1,13 +1,4 @@
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/osv_sync.yml'
-      - 'records/**/*.json'
-      - '!records/reservations/*.json'
-      - 'osv/*.json'
-      - 'scripts/cve-to-osv'
   schedule:
     # Run daily at 2 AM UTC
     - cron: '0 2 * * *'
@@ -19,52 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  auto_update:
-    name: "Auto-Update OSV Files for Main Branch"
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Login for auto updates
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          app-id: ${{ vars.CNA_BOT_APP_ID }}
-          private-key: ${{ secrets.CNA_BOT_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-      - name: Install Elixir
-        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
-        with:
-          elixir-version: '1.18.4'
-          otp-version: '27.3.4.1'
-      - name: Convert all CVE files to OSV format
-        run: './scripts/cve-to-osv convert-all'
-      - name: Create or update PR
-        uses: peter-evans/create-pull-request@v8
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          commit-message: "Update OSV files for CVE changes"
-          title: "Update OSV files for CVE changes"
-          body: |
-            This PR updates OSV files following changes to CVE records or the conversion script.
-
-            This automated update converts CVE records to OSV format to keep OSV files synchronized with the latest CVE data.
-
-            Changes in this PR:
-            - Updated OSV files to reflect the latest CVE record changes
-          labels: automated, osv-update
-          branch: osv-cve-updates
-          delete-branch: true
-          base: main
-
   update_versions:
     name: "Update OSV Affected Versions"
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Login for version updates
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -89,20 +37,11 @@ jobs:
       - name: Update OSV versions
         run: './scripts/cve-to-osv update-versions'
 
-      - name: Create or update PR
-        uses: peter-evans/create-pull-request@v8
-        with:
-          token: ${{ steps.osv-app-token.outputs.token }}
-          commit-message: "chore(osv): update affected package versions"
-          title: "Update OSV affected package versions"
-          body: |
-            This PR updates the affected versions in OSV files based on the latest package versions from hex.pm.
-
-            This is an automated update that runs daily to ensure OSV files contain all affected versions.
-
-            Changes in this PR:
-            - Updated `versions` arrays in OSV files with newly published hex packages that are affected by the vulnerabilities
-          labels: automated, osv-update
-          branch: osv-version-updates
-          delete-branch: true
-          base: main
+      - name: Commit and push changes
+        run: |
+          git add -A
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(osv): update affected package versions"
+          git push

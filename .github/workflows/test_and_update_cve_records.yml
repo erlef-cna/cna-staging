@@ -5,6 +5,7 @@ on:
   pull_request:
     branches:
       - 'main'
+  workflow_dispatch:
   schedule:
     - cron: "9 3 * * *"
 
@@ -18,13 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     if: "${{ vars.CNA_BOT_APP_ID }}"
     steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
           app-id: ${{ vars.CNA_BOT_APP_ID }}
           private-key: ${{ secrets.CNA_BOT_PRIVATE_KEY }}
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
       - name: CVE RSUS check and upload
         # TODO: Switch back to upstream once PRs are merged
         uses: erlef-cna/cna-bot@main
@@ -38,10 +41,28 @@ jobs:
           reservations-path : records/reservations
           min-reserved: 2
           reserve: 2
-          pr: ${{ github.event_name != 'pull_request' }}
           github-token: ${{ steps.app-token.outputs.token }}
           expire-after: "1y"
           delete-rejected: true
+          update-local: ${{ github.ref == 'refs/heads/main' }}
           # We also allow 3rd party advisories in case of unresponsive hex.pm
           # package maintainers
           ignore: "vendor-advisory"
+      - name: Install Elixir
+        if: github.ref == 'refs/heads/main'
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        with:
+          elixir-version: '1.18.4'
+          otp-version: '27.3.4.1'
+      - name: Convert all CVE files to OSV format
+        if: github.ref == 'refs/heads/main'
+        run: './scripts/cve-to-osv convert-all'
+      - name: Commit and push changes
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git add -A
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update CNA Files"
+          git push
