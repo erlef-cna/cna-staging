@@ -38,10 +38,13 @@ jobs:
         run: './scripts/cve-to-osv update-versions'
 
       - name: Commit and push changes
+        env:
+          BOT_APP_SLUG: ${{ vars.CNA_BOT_APP_SLUG }}
+          BOT_APP_ID: ${{ vars.CNA_BOT_APP_ID }}
         run: |
           git add -A
           git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "${BOT_APP_SLUG}[bot]"
+          git config user.email "${BOT_APP_ID}+${BOT_APP_SLUG}[bot]@users.noreply.github.com"
           git commit -m "chore(osv): update affected package versions"
           git push

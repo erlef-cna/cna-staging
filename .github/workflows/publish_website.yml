@@ -37,25 +37,31 @@ jobs:
 
       - name: "Update CVEs in Website"
         shell: bash
+        env:
+          WEBSITE_CVE_DIR: ${{ vars.WEBSITE_CVE_DIR }}
+          WEBSITE_OSV_DIR: ${{ vars.WEBSITE_OSV_DIR }}
         run: |
           mkdir -p \
-            website/_data/cves-staging && \
+            "website/${WEBSITE_CVE_DIR}" && \
           find records \
             -path 'records/reservations' -prune \
           -or \
             -type f -name '*.json' \
-            -exec cp -f {} website/_data/cves-staging/ \; && \
+            -exec cp -f {} "website/${WEBSITE_CVE_DIR}/" \; && \
           mkdir -p \
-            website/_data/osv-staging && \
+            "website/${WEBSITE_OSV_DIR}" && \
           find osv \
             -type f -name '*.json' \
-            -exec cp -f {} website/_data/osv-staging/ \;
+            -exec cp -f {} "website/${WEBSITE_OSV_DIR}/" \;
       - name: Commit and push changes
         working-directory: website
+        env:
+          BOT_APP_SLUG: ${{ vars.CNA_BOT_APP_SLUG }}
+          BOT_APP_ID: ${{ vars.CNA_BOT_APP_ID }}
         run: |
           git add -A
           git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore(data): sync Staging CVE JSON from records/"
+          git config user.name "${BOT_APP_SLUG}[bot]"
+          git config user.email "${BOT_APP_ID}+${BOT_APP_SLUG}[bot]@users.noreply.github.com"
+          git commit -m "chore(data): sync CVE and OSV JSON from records/"
           git push
