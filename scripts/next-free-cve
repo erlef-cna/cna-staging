@@ -1,9 +1,5 @@
 #!/usr/bin/env elixir
 
-Mix.install([
-  {:jason, "~> 1.4"}
-])
-
 defmodule NextFreeCVE do
   @records_base_path Path.expand("../records", __DIR__)
   @reservations_path Path.expand("reservations", @records_base_path)
@@ -56,14 +52,11 @@ defmodule NextFreeCVE do
     end
   end
 
-  # IDs with state "RESERVED" in the reservations directory for the given year
+  # IDs in the reservations directory for the given year
   defp reserved_ids(year) do
     @reservations_path
     |> Path.join("CVE-#{year}-*.json")
     |> Path.wildcard()
-    |> Enum.filter(fn path ->
-      path |> File.read!() |> Jason.decode!() |> Map.fetch!("state") == "RESERVED"
-    end)
     |> Enum.map(&cve_id_from_path/1)
     |> MapSet.new()
   end
@@ -81,7 +74,7 @@ defmodule NextFreeCVE do
 
     pr_numbers =
       output
-      |> Jason.decode!()
+      |> JSON.decode!()
       |> Enum.map(& &1["number"])
 
     pr_numbers
@@ -99,7 +92,7 @@ defmodule NextFreeCVE do
       ])
 
     output
-    |> Jason.decode!()
+    |> JSON.decode!()
     |> Map.fetch!("files")
     |> Enum.map(& &1["path"])
     |> Enum.filter(&String.contains?(&1, "CVE-#{year}-"))
@@ -117,7 +110,7 @@ defmodule NextFreeCVE do
 
   defp repo do
     {output, 0} = System.cmd("gh", ["repo", "view", "--json", "nameWithOwner"])
-    output |> Jason.decode!() |> Map.fetch!("nameWithOwner")
+    output |> JSON.decode!() |> Map.fetch!("nameWithOwner")
   end
 end
 
