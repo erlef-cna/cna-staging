@@ -18,7 +18,10 @@ gh api /repos/<owner>/<repo>/security-advisories/<ghsa-id>
 Extract and present:
 - Summary and description
 - Affected package + version range
-- Credits (reporter, fix authors, etc.) — for each GitHub login in `credits`, look up their real name via `gh api /users/<login>` and use the `name` field; never guess from the username
+- Credits (reporter, fix authors, etc.) — for each GitHub login in `credits`, look up their real name via `gh api /users/<login>` and use the `name` field; never guess from the username. Known canonical-name overrides:
+  - `IngelaAndin` → `Ingela Anderton Andin` (the GitHub `name` field returns "Ingela Andin", but past records in this repo use the full name)
+  - `maennchen` (Jonatan Männchen) → `Jonatan Männchen / EEF` (when acting in his EEF capacity, e.g. as `analyst` or coordinator on EEF-handled advisories — append ` / EEF`)
+  - `u3s` → `Jakub Witczak` (the GitHub `name` field only returns "Kuba")
 - CVSS if present (treat as a starting point only)
 - Fix commit / patched version (if available)
 - CVE ID if already assigned in the advisory
@@ -52,6 +55,8 @@ Review the advisory critically and discuss with the user:
 
 Present your assessment and proposed changes. **Wait for user confirmation before proceeding.**
 
+Do not look up the introducing commit here. That happens in Step 5 via `/find-intro-commit`.
+
 ## Step 4 — Choose a CVE number
 
 ### If the advisory already has a CVE ID assigned:
@@ -71,10 +76,21 @@ Create the record at `records/<year>/<CVE-ID>.json` following all conventions fr
 
 Key things to get right:
 - `cveMetadata`: only `assignerOrgId`, `assignerShortName`, `cveId`, `state: "PUBLISHED"` — no date fields
-- Two affected entries: package registry purl first, `pkg:github/...` second (see CLAUDE.md for type-specific rules)
+- Two affected entries: package registry purl first, `pkg:github/...` second (see CLAUDE.md for type-specific rules). Edge case: the hex package manager itself uses `pkg:otp/hex?repository_url=...&vcs_url=...` (not `pkg:hex/hex` — hex cannot list itself in its own registry), but `versionType` stays `"semver"` because hex follows real semver.
 - `programRoutines`: always use Erlang notation `module:function/arity`. Elixir modules get the `'Elixir.ModuleName'` atom prefix — e.g. `'Elixir.Decimal':add/2`, `'Elixir.Hexpm.Store.Local':get/3`. Pure Erlang modules are lowercase — e.g. `ssh_sftpd:handle_op/4`.
+- `programRoutines` lists the routines that are *vulnerable*, not every routine the fix commit happens to touch. Skip bookkeeping helpers (changelog writers, version bumps, test-only changes) that the patch incidentally modifies.
+- **Cross-language reachability for NIFs/BIFs.** `modules` and `programRoutines` exist so a consumer can answer "does my code reach the bug?" When the vulnerable code lives behind a language boundary (Rust NIF, C BIF, port driver), list **both sides** of the call chain on every affected entry:
+  - The implementing module/function (e.g. Rust crate `mdex_native_nif`, function `mdex_native_nif::lumis_adapter::LumisAdapter::parse_highlight_lines`).
+  - The Erlang/Elixir module(s) and function(s) callers actually invoke (e.g. `'Elixir.MDEx'` and `'Elixir.MDEx':to_html/2`, or the NIF binding wrapper like `'Elixir.MDEx.Native':document_to_html_with_options/2`).
+- **Extraction packages.** If vulnerable code in package A was later extracted into a new package B (still in the vulnerable versions of A), treat them as separate affected products:
+  - A's upper bound is the extraction commit / version (the bug is no longer present in A after the extraction).
+  - B is listed as a separate affected entry, with its own version range starting at its first release.
+  - The patch reference points only at B's fix commit, since A is no longer where a fix would land.
 - `programFiles`, `programRoutines`, and `modules` on every affected entry — populate from the advisory or repo inspection
+- `defaultStatus` on each affected entry must be `"unaffected"` when versions are bounded. `"affected"` implicitly marks every unlisted version (older releases, post-fix releases) as vulnerable, which is almost never what we mean.
+- `repo` URL must not have a `.git` suffix (for GitHub) and must match on every affected entry for the same project (e.g. always `https://github.com/<owner>/<repo>`).
 - `cpes` on every affected entry + `cpeApplicability` at the top level — use `"TODO"` for unknown fix versions
+- `cpeApplicability` operator orientation: outer node is `"OR"` (any of the listed products can match), each inner `cpeMatch` group is `"AND"` (a match within that product requires all criteria). Do not invert these.
 - `problemTypes`: use the `/find-cwe` skill to find the right CWE
 - `impacts`: use the `/find-capec` skill to find the right CAPEC attack pattern(s)
 - References in the required order (vendor advisory → CNA page → OSV → remaining)
@@ -83,6 +99,7 @@ Key things to get right:
 - `source.discovery`: `EXTERNAL` for third-party reporters, `INTERNAL` for team-found, `UNKNOWN` if unclear
 - CVSS from Step 2 — `baseScore` and `baseSeverity` must be filled with real values from `scripts/cvss-score`, never left as `0.0`/`"UNKNOWN"`
 - For the introducing commit SHA: **always use the `/find-intro-commit` skill** — never attempt to find it manually or guess
+- Cross-check the introducing commit against the advisory's "first affected version": once `/find-intro-commit` returns a SHA, run `git tag --contains <sha>` and confirm that the earliest reachable tag matches what the advisory claims. Advisories sometimes list the wrong first version. If they disagree, trust the SHA + tag containment and update the version range accordingly.
 - For `versionType: "git"` entries, always use the actual commit SHA — never the tag SHA. The introducing `version` comes from `/find-intro-commit` (a commit that predates any release tag). The `lessThan` fix SHA comes from the patch commit, not from `git rev-parse <tag>^{}`.
 - Only use `changes` in a version entry when there are multiple fix points (e.g. backported patches across release lines). For a single fix, express it with `lessThan` pointing to the fix version.
 - If there is no patched version yet, use `"TODO"` as the placeholder in version entries, `cpeApplicability`, patch reference URLs, and in the description text (e.g. "from 0.6.0 before TODO")

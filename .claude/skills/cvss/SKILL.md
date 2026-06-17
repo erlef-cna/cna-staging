@@ -14,6 +14,12 @@ Read the current CVE record, analyze the vulnerability, and produce a CVSS v4.0 
 ### Attack Vector (AV)
 **Only use Network if the vulnerable component itself directly handles network traffic** (e.g. a web framework, HTTP server, network protocol library). A general-purpose library (e.g. a decimal math lib, JSON parser) is Local even if an app could theoretically expose it over the network.
 
+**Within a network-handling library, encoders vs decoders split:**
+- **Encoder bugs are AV:L.** An encoder runs on whatever the application passes in as arguments. The attacker has to first influence those arguments through application-level code paths (e.g. method/target injection in `Mint.HTTP.request/5`, filename in `Req`'s multipart form encoder). That is an application-reachability problem, not a network one.
+- **Decoder/parser bugs that process bytes off the network are AV:N.** A decoder runs on whatever arrives over the wire from the remote peer (e.g. HTTP/2 frame parsers, response `Content-Length` parsers, response-body decompressors). The attacker reaches it by speaking the protocol.
+
+When in doubt: ask "does the attacker reach this by sending HTTP bytes, or by getting the application to pass a string?" The former is AV:N, the latter is AV:L.
+
 | Value | Description |
 |-------|-------------|
 | N — Network | The vulnerable system is bound to the network stack and the set of possible attackers extends beyond the other options listed below, up to and including the entire Internet. |

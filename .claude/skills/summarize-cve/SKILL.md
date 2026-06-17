@@ -36,7 +36,7 @@ Use the GHSA `description` field for additional technical detail — the raw adv
 
 Write the output to `/tmp/cve-summary-<CVE-ID>.md`, then run `code /tmp/cve-summary-<CVE-ID>.md` to open it in the editor. Do not print the content to the terminal.
 
-Output exactly the following sections. Keep each section concise. Use code blocks only where the snippet directly illustrates the vulnerability mechanism. Use `TODO` in URLs where the actual value is not yet known (e.g. patch commit not yet assigned).
+Output exactly the following sections. All section headings must be H3 (`###`), never H2. Keep each section concise. Do not include code blocks or source-code snippets anywhere in the output — describe the relevant code in prose, referencing file and function names. Use `TODO` for any value that is not yet known, both in URLs and in prose (e.g. `from 0.1.0 before TODO`); do not paraphrase as "latest release at time of filing" or similar.
 
 ---
 
@@ -46,7 +46,7 @@ One short paragraph: what the vulnerability is, what it allows, and who can trig
 
 ### Details
 
-Technical deep-dive, structured with bold sub-headings if the vulnerability is a multi-step chain (e.g. **1. Input handling**, **2. Unsafe processing**, **3. Execution**). Include relevant file names and function names. Include a short code snippet only when it directly illustrates the flaw. Omit filler.
+Technical deep-dive, structured with bold sub-headings if the vulnerability is a multi-step chain (e.g. **1. Input handling**, **2. Unsafe processing**, **3. Execution**). Include relevant file names and function names. Do not include code blocks. Omit filler.
 
 ### PoC
 
@@ -54,14 +54,16 @@ Numbered steps: the minimum steps to reproduce. Not a complete working exploit �
 
 ### Impact
 
-One or two sentences: severity, who is affected, version range. Reference CVSS score and severity if available.
+One or two sentences describing the user-visible consequences of the vulnerability (what an attacker can do, who is affected in practical terms). Do not include affected version ranges (they live in the structured fields), do not include the CVSS score or severity, do not explain CVSS metric choices, and never write "no fix available" — CVEs are only published once a fix exists.
 
-## References
+### References
 
 A flat list of relevant links in this order:
 1. Introduction commit (if known from the `version` field of the git version entry — use `TODO` if absent)
 2. Patch commit(s) (from `"patch"`-tagged references — use `TODO` if not yet known)
-3. Any other references from the CVE record worth highlighting (do not include the GHSA link)
+3. Any other references that add genuinely useful context (e.g. upstream bug reports, related write-ups, documentation pages)
+
+Never include the CNA advisory page (`cna.erlef.org/cves/...`), the CVE.org record, the GHSA link, or the OSV link — those are aggregator URLs that just point back at this same data.
 
 Use this format for each line:
 ```

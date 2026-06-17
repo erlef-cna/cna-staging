@@ -9,6 +9,8 @@ defmodule NextFreeCVE do
   @reservations_path Path.expand("reservations", @records_base_path)
 
   def run do
+    check_up_to_date_with_main()
+
     year = Date.utc_today().year |> Integer.to_string()
 
     reserved = reserved_ids(year)
@@ -31,6 +33,29 @@ defmodule NextFreeCVE do
     end
   end
 
+  defp check_up_to_date_with_main do
+    {output, 0} =
+      System.cmd("gh", [
+        "api", "repos/{owner}/{repo}/commits/main",
+        "--jq", ".sha"
+      ])
+
+    main_sha = String.trim(output)
+
+    {_output, code} = System.cmd("git", ["merge-base", "--is-ancestor", main_sha, "HEAD"])
+
+    if code != 0 do
+      IO.puts(:stderr, """
+      Error: your branch is not up to date with main.
+
+      The latest commit on main (#{main_sha}) is not in your local history.
+      Please run: git fetch && git rebase origin/main
+      """)
+
+      System.halt(1)
+    end
+  end
+
   # IDs with state "RESERVED" in the reservations directory for the given year
   defp reserved_ids(year) do
     @reservations_path
@@ -50,7 +75,8 @@ defmodule NextFreeCVE do
         "pr", "list",
         "--repo", repo(),
         "--state", "open",
-        "--json", "number"
+        "--json", "number",
+        "--limit", "500"
       ])
 
     pr_numbers =

@@ -1,0 +1,1463 @@
+#!/usr/bin/env elixir
+
+# file-cve - drive the local authoring phase (Phase 0) of filing a CVE.
+#
+# Steps (see the EEF CNA workflow):
+#   0.1  pick the lowest free reserved CVE ID      (scripts/next-free-cve)
+#   0.2  scaffold the record JSON                  (records/<year>/CVE-*.json)
+#   0.3  claim the ID by deleting its reservation  (records/reservations/CVE-*.json)
+#   0.4  format + validate + lint the record       (cve-formatter / cve-schema-validate / cvelint)
+#   0.5  open the PR against main                  (separate `pr` subcommand)
+#
+# Every step is a no-op when already done, so the script is safe to re-run.
+# Skill-backed steps (content drafting 0.2b, convention check 0.4d) shell out to
+# the `claude` CLI (/new-cve to draft, /verify to check). Disable with --no-claude.
+#
+# Usage:
+#   scripts/file-cve [prepare] [CVE-ID] [--advisory URL] [--no-claude]
+#   scripts/file-cve draft     [CVE-ID] [--advisory URL]      # 0.2b only (/new-cve)
+#   scripts/file-cve verify    [CVE-ID]                       # 0.4 only (/verify)
+#   scripts/file-cve pr        [CVE-ID] [--draft|--ready]     # step 0.5 (open the PR)
+#   scripts/file-cve update    [CVE-ID] [URL]                 # reconcile a record with its advisory (URL defaults to the record's GHSA reference), then open/update its PR
+#   scripts/file-cve update-cvss          [CVE-ID] VECTOR     # set the CVSS v4.0 metric from a vector
+#   scripts/file-cve switch    OLD-ID [NEW-ID] [--from REF]   # re-home a record to a new ID
+#   scripts/file-cve status                                   # show the working CVE ID
+
+defmodule FileCVE do
+  @org_id "6b3ad84c-e1a6-4bf7-a703-f496b71e49db"
+  @scripts_dir __DIR__
+
+  # CVSS v4.0 Base metrics: abbreviation -> {JSON field, %{value abbrev => full}}.
+  # Only Base metrics are scored (see the /cvss skill), so anything else in a
+  # vector string is rejected. Drives `update-cvss`.
+  @cvss_metrics %{
+    "AV" => {"attackVector", %{"N" => "NETWORK", "A" => "ADJACENT", "L" => "LOCAL", "P" => "PHYSICAL"}},
+    "AC" => {"attackComplexity", %{"L" => "LOW", "H" => "HIGH"}},
+    "AT" => {"attackRequirements", %{"N" => "NONE", "P" => "PRESENT"}},
+    "PR" => {"privilegesRequired", %{"N" => "NONE", "L" => "LOW", "H" => "HIGH"}},
+    "UI" => {"userInteraction", %{"N" => "NONE", "P" => "PASSIVE", "A" => "ACTIVE"}},
+    "VC" => {"vulnConfidentialityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}},
+    "VI" => {"vulnIntegrityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}},
+    "VA" => {"vulnAvailabilityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}},
+    "SC" => {"subConfidentialityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}},
+    "SI" => {"subIntegrityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}},
+    "SA" => {"subAvailabilityImpact", %{"H" => "HIGH", "L" => "LOW", "N" => "NONE"}}
+  }
+  @cvss_order ~w(AV AC AT PR UI VC VI VA SC SI SA)
+
+  # Absolute path to a sibling script (System.cmd will not exec a relative path).
+  defp script(name), do: Path.join(@scripts_dir, name)
+
+  # ---- output (Mix shell: info -> stdout, error -> stderr) ------------------
+  defp info(m), do: Mix.Shell.IO.info(m)
+  defp error(m), do: Mix.Shell.IO.error(m)
+  defp step(m), do: Mix.Shell.IO.info("\n" <> m)
+  defp halt_fail(m), do: (error(m); System.halt(1))
+
+  # ---- path / id helpers ----------------------------------------------------
+  defp record_path(id), do: "records/#{String.slice(id, 4, 4)}/#{id}.json"
+  defp reservation_path(id), do: "records/reservations/#{id}.json"
+  defp valid_id?(id), do: is_binary(id) and Regex.match?(~r/^CVE-\d{4}-\d+$/, id)
+  defp has_todos?(path), do: File.exists?(path) and String.contains?(File.read!(path), "TODO")
+  defp pristine_stub?(path), do: File.exists?(path) and Regex.match?(~r/"title":\s*"TODO"/, File.read!(path))
+
+  # ---- git helpers ----------------------------------------------------------
+  defp git_out(args) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> String.trim(out)
+      _ -> nil
+    end
+  end
+
+  defp git_ok?(args) do
+    {_, status} = System.cmd("git", args, stderr_to_stdout: true)
+    status == 0
+  end
+
+  defp git!(args) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> out
+      {out, code} -> IO.write(out); halt_fail("git #{Enum.join(args, " ")} failed (#{code})")
+    end
+  end
+
+  defp git_show(ref) do
+    case System.cmd("git", ["show", ref], stderr_to_stdout: true) do
+      {out, 0} -> out
+      _ -> nil
+    end
+  end
+
+  # Run a git command inside the worktree at `wt` (the `pr` step works there so
+  # parallel runs never switch the shared checkout's branch).
+  defp git_wt!(wt, args), do: git!(["-C", wt | args])
+  defp git_wt_ok?(wt, args), do: git_ok?(["-C", wt | args])
+
+  # ---- claude (skill) delegation -------------------------------------------
+  defp claude_available?(st), do: st.use_claude and System.find_executable(st.claude_bin) != nil
+
+  # Headless skill run (mechanical skills like /verify). Output is streamed so
+  # the user sees progress; tools are allowlisted so it never blocks on a prompt.
+  # stdin is redirected from /dev/null (via `sh -c 'exec "$0" "$@" < /dev/null'`,
+  # which keeps every arg separate so the prompt needs no shell-escaping) so claude
+  # does not stall ~3s waiting on a TTY it will never read (it has the prompt via -p).
+  defp run_skill_headless(st, prompt) do
+    args =
+      ["-c", ~s(exec "$0" "$@" < /dev/null), st.claude_bin,
+       "-p", prompt, "--permission-mode", st.claude_perm,
+       "--allowedTools", "Bash Read Edit Write Glob Grep"]
+
+    {_, status} = System.cmd("sh", args, into: IO.stream(:stdio, :line), stderr_to_stdout: true)
+    status == 0
+  end
+
+  # Interactive skill run (/new-cve needs user judgement). A :nouse_stdio port
+  # leaves fds 0/1/2 to the child, so claude inherits the real terminal.
+  defp run_skill_interactive(st, prompt) do
+    exe = System.find_executable(st.claude_bin)
+
+    port =
+      Port.open({:spawn_executable, exe}, [
+        :nouse_stdio,
+        :exit_status,
+        args: [prompt, "--permission-mode", st.claude_perm]
+      ])
+
+    receive do
+      {^port, {:exit_status, status}} -> status
+    end
+  end
+
+  # ---- origin/main reconciliation -------------------------------------------
+  # next-free-cve trusts the LOCAL reservations dir, which goes stale when local
+  # main lags origin/main: an ID can be published (and its reservation deleted)
+  # upstream while still showing RESERVED locally, handing out an ID that
+  # add/add-conflicts on merge. These guard against exactly that.
+  defp fetch_main_once do
+    unless Process.get(:main_fetched) do
+      Process.put(:main_fetched, true)
+
+      case System.cmd("git", ["fetch", "-q", "origin", "main"], stderr_to_stdout: true) do
+        {_, 0} -> :ok
+        _ -> info("could not fetch origin/main (offline?), staleness check is limited")
+      end
+    end
+
+    :ok
+  end
+
+  defp assert_id_available(id) do
+    fetch_main_once()
+
+    if git_ok?(["rev-parse", "--verify", "-q", "origin/main"]) do
+      cond do
+        git_ok?(["cat-file", "-e", "origin/main:" <> record_path(id)]) ->
+          error("#{id} is already PUBLISHED on origin/main (a different CVE), your local reservation list is stale.")
+          behind = git_out(["rev-list", "--count", "main..origin/main"]) || "?"
+          error("  local main is behind origin/main by #{behind} commits.")
+          error("  sync first:  git fetch origin && git switch main && git merge --ff-only origin/main")
+          error("  then re-run, next-free-cve will pick a genuinely free ID.")
+          System.halt(1)
+
+        not git_ok?(["cat-file", "-e", "origin/main:" <> reservation_path(id)]) ->
+          error("#{id} is no longer reserved on origin/main (already consumed), local view is stale.")
+          error("  sync main (git merge --ff-only origin/main) and re-run.")
+          System.halt(1)
+
+        true ->
+          :ok
+      end
+    end
+  end
+
+  # Lowest free reserved CVE id. next-free-cve runs under Mix.install, which
+  # prints dependency noise to stdout on first run, so keep the last CVE match.
+  defp pick_next_free do
+    case System.cmd(script("next-free-cve"), [], stderr_to_stdout: true) do
+      {out, 0} -> Regex.scan(~r/CVE-\d{4}-\d+/, out) |> List.flatten() |> List.last()
+      _ -> nil
+    end
+  end
+
+  # ---- 0.1  resolve / pick the working CVE ID -------------------------------
+  defp resolve_id(explicit, st) when is_binary(explicit) do
+    unless valid_id?(explicit), do: halt_fail("Not a valid CVE ID: #{explicit}")
+    File.write!(st.state_file, explicit)
+    explicit
+  end
+
+  defp resolve_id(nil, st) do
+    saved = if File.exists?(st.state_file), do: String.trim(File.read!(st.state_file)), else: ""
+
+    # Reuse a previously picked ID only if its record still exists, otherwise the
+    # scaffold/claim has not happened yet and we should pick fresh.
+    if saved != "" and File.exists?(record_path(saved)) do
+      saved
+    else
+      picked = pick_next_free()
+      if picked in [nil, ""], do: halt_fail("next-free-cve produced no CVE ID")
+      File.write!(st.state_file, picked)
+      picked
+    end
+  end
+
+  # The update-* commands act on an existing record. The target ID is the one the
+  # user passed (and we remember it), else the saved working id. The record need
+  # not be present in the working tree yet: materialize_base! brings it in.
+  defp update_target_id(nil, st) do
+    saved = if File.exists?(st.state_file), do: String.trim(File.read!(st.state_file)), else: ""
+    if saved == "", do: halt_fail("no working CVE; run prepare first or pass a CVE-ID")
+    saved
+  end
+
+  defp update_target_id(id, st) do
+    File.write!(st.state_file, id)
+    id
+  end
+
+  # Read the record to amend, preferring the open draft branch (so we build on its
+  # in-progress edits) over any uncommitted working-tree copy, then the published
+  # record. Returns the JSON string, or nil if no record exists for this id.
+  defp read_record_base(id) do
+    path = record_path(id)
+    fetch_main_once()
+    branch = resolve_branch(id)
+    ref = if git_ok?(["rev-parse", "--verify", "-q", branch]), do: branch, else: "origin/#{branch}"
+
+    cond do
+      git_ok?(["cat-file", "-e", "#{ref}:" <> path]) -> git_show("#{ref}:" <> path)
+      File.exists?(path) -> File.read!(path)
+      git_ok?(["cat-file", "-e", "origin/main:" <> path]) -> git_show("origin/main:" <> path)
+      true -> nil
+    end
+  end
+
+  # The PR branch for an id. The branch name is not fixed: this script files under
+  # `cve/<id>`, but coworkers use `<initials>/<id>` (e.g. `jm/CVE-2026-49757`). So
+  # prefer any existing branch (local, else remote) that carries this CVE id, and
+  # only fall back to the `cve/<id>` default for a brand-new filing. A coworker's
+  # remote branch is fetched so it resolves locally and the `pr` step lands the
+  # update on their PR instead of forking a new branch. Used by both reads and `pr`.
+  defp resolve_branch(id) do
+    cond do
+      is_binary(l = local_branch_for(id)) -> sync_local_branch(l); l
+      is_binary(r = remote_branch_for(id)) -> fetch_pr_branch(r); r
+      true -> "cve/#{id}"
+    end
+  end
+
+  # Fast-forward a local PR branch to its origin counterpart so we build on a
+  # coworker's latest pushes. We never check the branch out (the worktree model),
+  # so update the ref directly with a fetch refspec; this is fast-forward-only, so
+  # a diverged local branch (your own unpushed commits, or the branch checked out
+  # here) is left untouched with a note, exactly like `git pull --ff-only`.
+  defp sync_local_branch(branch) do
+    if git_ok?(["ls-remote", "--exit-code", "--heads", "origin", branch]) do
+      case System.cmd("git", ["fetch", "-q", "origin", "#{branch}:#{branch}"], stderr_to_stdout: true) do
+        {_, 0} -> info("fast-forwarded #{branch} to origin/#{branch}")
+        _ -> info("left #{branch} as-is (diverged from origin/#{branch}, checked out, or offline); reconcile manually if needed")
+      end
+    end
+  end
+
+  # A CVE id matches a branch named exactly for it or ending in `/<id>` (so
+  # `CVE-2026-4885` does not match `CVE-2026-48853`).
+  defp branch_matches_id?(name, id), do: name == id or String.ends_with?(name, "/" <> id)
+
+  defp local_branch_for(id) do
+    (git_out(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]) || "")
+    |> String.split("\n", trim: true)
+    |> Enum.find(&branch_matches_id?(&1, id))
+  end
+
+  defp remote_branch_for(id) do
+    case System.cmd("git", ["ls-remote", "--heads", "origin"], stderr_to_stdout: true) do
+      {out, 0} ->
+        out
+        |> String.split("\n", trim: true)
+        |> Enum.map(fn line -> line |> String.split("refs/heads/") |> List.last() end)
+        |> Enum.find(&branch_matches_id?(&1, id))
+
+      _ ->
+        nil
+    end
+  end
+
+  # Fetch a PR branch from origin, updating its refs/remotes/origin/<branch>.
+  # Tolerant of no remote / offline / no such branch.
+  defp fetch_pr_branch(branch) do
+    case System.cmd("git", ["fetch", "-q", "origin", branch], stderr_to_stdout: true) do
+      {_, 0} -> info("fetched origin/#{branch} (existing PR branch)")
+      _ -> :ok
+    end
+  end
+
+  # Put that base content in the working tree so the formatter, validators, claude,
+  # and the later `pr` step (all of which operate on the shared checkout) see it.
+  # The checkout stays on main: `pr` commits onto cve/<id> in an isolated worktree
+  # and restores the tree, so parallel filings never switch each other's branch.
+  # Returns the base content.
+  defp materialize_base!(id) do
+    base = read_record_base(id) || halt_fail("no record found for #{id} (no branch cve/#{id}, no published record); is the ID correct?")
+    path = record_path(id)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, base)
+    base
+  end
+
+  defp submit_hint(id) do
+    IO.puts("\n#{id} is staged in the working tree. Open / update its PR with:\n  scripts/file-cve pr #{id}        # commits onto its PR branch in an isolated worktree")
+  end
+
+  # Split positional args into the (optional) CVE id and the leftover value
+  # (a vector string or advisory URL), in any order.
+  defp split_id_and_value(args) do
+    {ids, vals} = Enum.split_with(args, &valid_id?/1)
+    {List.first(ids), List.first(vals)}
+  end
+
+  # ---- 0.2  scaffold the record stub ----------------------------------------
+  defp scaffold_record(id) do
+    path = record_path(id)
+
+    if File.exists?(path) do
+      info("0.2  record exists: #{path}")
+    else
+      File.mkdir_p!(Path.dirname(path))
+      # Compact JSON is fine; cve-formatter (0.4a) pretty-prints/sorts it next.
+      File.write!(path, JSON.encode!(scaffold_map(id)))
+      info("0.2  scaffolded stub: #{path}")
+      info("      fill in the TODOs (title, descriptions, affected, metrics, source.discovery, vendor advisory + patch URLs)")
+    end
+  end
+
+  defp scaffold_map(id) do
+    %{
+      "dataType" => "CVE_RECORD",
+      "dataVersion" => "5.2",
+      "cveMetadata" => %{
+        "assignerOrgId" => @org_id,
+        "assignerShortName" => "EEF",
+        "cveId" => id,
+        "state" => "PUBLISHED"
+      },
+      "containers" => %{
+        "cna" => %{
+          "affected" => [],
+          "credits" => [],
+          "descriptions" => [
+            %{
+              "lang" => "en",
+              "value" => "TODO",
+              "supportingMedia" => [%{"base64" => false, "type" => "text/html", "value" => "<p>TODO</p>"}]
+            }
+          ],
+          "metrics" => [],
+          "providerMetadata" => %{"orgId" => @org_id, "shortName" => "EEF"},
+          "references" => [
+            %{"tags" => ["vendor-advisory"], "url" => "TODO"},
+            %{"tags" => ["related"], "url" => "https://cna.erlef.org/cves/#{id}.html"},
+            %{"tags" => ["related"], "url" => "https://osv.dev/vulnerability/EEF-#{id}"},
+            %{"tags" => ["patch"], "url" => "https://github.com/TODO/TODO/commit/TODO"}
+          ],
+          "source" => %{"discovery" => "TODO"},
+          "title" => "TODO"
+        }
+      }
+    }
+  end
+
+  # ---- 0.2b  draft the content via the /new-cve skill -----------------------
+  # Returns :ran when /new-cve was actually launched (it then owns Steps 6+7:
+  # claim the reservation and run /verify), else :not_run.
+  defp draft_content(id, url, force, st) do
+    path = record_path(id)
+
+    cond do
+      not force and not pristine_stub?(path) ->
+        info("0.2b content already drafted, not launching /new-cve (use 'draft #{id}' to redraft)")
+        :not_run
+
+      not claude_available?(st) ->
+        info("0.2b skill draft skipped (claude unavailable or --no-claude), fill the TODOs by hand")
+        :not_run
+
+      is_binary(url) and url != "" ->
+        info("0.2b launching /new-cve for #{url} (interactive, exit claude to continue)")
+        run_skill_interactive(st, "/new-cve #{url}")
+        :ran
+
+      true ->
+        info("0.2b no --advisory URL given; launching /new-cve interactively for #{path}")
+        run_skill_interactive(st, "/new-cve (fill record #{path})")
+        :ran
+    end
+  end
+
+  # ---- update: reconcile an existing record with its advisory ----------------
+  # Like draft_content, but for a record that already has content: re-fetch the
+  # advisory and reconcile it instead of filling a pristine stub. Always
+  # interactive (needs user judgement); the `update` command opens the PR after.
+  defp update_from_advisory(id, url, st) do
+    path = record_path(id)
+
+    cond do
+      not (is_binary(url) and url != "") ->
+        halt_fail("update needs an advisory URL (none given and the record has no GHSA reference): scripts/file-cve update [CVE-ID] [URL]")
+
+      not claude_available?(st) ->
+        halt_fail("update needs the claude CLI (unavailable or --no-claude)")
+
+      true ->
+        info("launching claude to reconcile #{path} with #{url} (interactive, exit claude to continue)")
+
+        prompt =
+          "Update the existing CVE record #{path} from this advisory: #{url}. " <>
+            "Fetch the advisory, then reconcile the record's descriptions, affected " <>
+            "versions, references, credits, and CVSS metrics with it. Keep the existing " <>
+            "CVE ID and follow the repo conventions in CLAUDE.md. Run /verify when done."
+
+        run_skill_interactive(st, prompt)
+    end
+  end
+
+  # ---- update-cvss: write a CVSS v4.0 metric block from a vector string ------
+  # Deterministic: parse the Base-metric vector into the field names CVE records
+  # use, call cvss-score for the real numeric score/severity, and replace any
+  # existing CVSS v4.0 metric in the record.
+  defp update_cvss(id, base, vector) do
+    path = record_path(id)
+    metric = build_cvss_metric(vector)
+    cvss = metric["cvssV4_0"]
+
+    metrics = get_in(data = JSON.decode!(base), ["containers", "cna", "metrics"]) || []
+    prev = Enum.find_value(metrics, fn m -> m["cvssV4_0"] end)
+    others = Enum.reject(metrics, &Map.has_key?(&1, "cvssV4_0"))
+
+    data = put_in(data, ["containers", "cna", "metrics"], [metric | others])
+    File.write!(path, JSON.encode!(data))
+
+    info("update-cvss: previous: #{cvss_summary(prev)}")
+    info("update-cvss: new:      #{cvss_summary(cvss)}")
+    if prev && prev["vectorString"] == cvss["vectorString"], do: info("update-cvss: note: vector unchanged (record already had this CVSS)")
+  end
+
+  # "9.2 CRITICAL (CVSS:4.0/...)" for an existing/new metric, or "(none)".
+  defp cvss_summary(nil), do: "(none)"
+  defp cvss_summary(cvss), do: "#{cvss["baseScore"]} #{cvss["baseSeverity"]} (#{cvss["vectorString"]})"
+
+  defp build_cvss_metric(vector) do
+    {score, severity} = cvss_score(vector)
+
+    cvss =
+      vector
+      |> parse_cvss_vector()
+      |> Map.merge(%{
+        "vectorString" => vector,
+        "version" => "4.0",
+        "baseScore" => score,
+        "baseSeverity" => severity
+      })
+
+    %{
+      "cvssV4_0" => cvss,
+      "format" => "CVSS",
+      "scenarios" => [%{"lang" => "en", "value" => "GENERAL"}]
+    }
+  end
+
+  # Map a "CVSS:4.0/AV:N/AC:L/..." string to the record's metric fields, halting
+  # on any unknown metric, bad value, or missing required Base metric.
+  defp parse_cvss_vector(vector) do
+    parts = String.split(vector, "/")
+    unless match?(["CVSS:4.0" | _], parts), do: halt_fail("not a CVSS v4.0 vector (must start with CVSS:4.0/): #{vector}")
+
+    fields =
+      parts
+      |> tl()
+      |> Enum.reduce(%{}, fn part, acc ->
+        case String.split(part, ":", parts: 2) do
+          [k, v] ->
+            case @cvss_metrics[k] do
+              nil ->
+                halt_fail("unknown/unsupported CVSS metric #{inspect(k)} (only Base metrics are scored)")
+
+              {field, values} ->
+                full = values[v] || halt_fail("invalid value #{inspect(v)} for #{k} in CVSS vector")
+                Map.put(acc, field, full)
+            end
+
+          _ ->
+            halt_fail("malformed CVSS metric #{inspect(part)} in vector")
+        end
+      end)
+
+    missing =
+      Enum.filter(@cvss_order, fn k ->
+        {field, _} = @cvss_metrics[k]
+        not Map.has_key?(fields, field)
+      end)
+
+    unless missing == [], do: halt_fail("CVSS vector missing required Base metrics: #{Enum.join(missing, ", ")}")
+    fields
+  end
+
+  # Real numeric score + severity from the cvss-score helper (the cvss lib).
+  defp cvss_score(vector) do
+    case System.cmd(script("cvss-score"), [vector], stderr_to_stdout: true) do
+      {out, 0} ->
+        score =
+          case Regex.run(~r/Score:\s*([\d.]+)/, out) do
+            [_, s] -> elem(Float.parse(s), 0)
+            _ -> halt_fail("could not parse score from cvss-score output:\n#{out}")
+          end
+
+        severity =
+          case Regex.run(~r/Severity:\s*(\w+)/, out) do
+            [_, s] -> s
+            _ -> halt_fail("could not parse severity from cvss-score output:\n#{out}")
+          end
+
+        {score, severity}
+
+      {out, _} ->
+        IO.write(out)
+        halt_fail("cvss-score failed for #{vector}")
+    end
+  end
+
+  # ---- push to the GitHub advisory (update-advisory / set-advisory-description)
+  # These send data the other direction from `update`: the local CVE
+  # record (source of truth) -> the published GHSA. Writes are gated behind --apply;
+  # without it the commands only print the before/after and the gh command.
+
+  # Parse {owner, repo, ghsa} out of a GitHub advisory URL, or nil if it is not one.
+  defp parse_ghsa_url(url) do
+    case Regex.run(~r{github\.com/([^/]+)/([^/]+)/security/advisories/(GHSA-[0-9a-z-]+)}i, to_string(url)) do
+      [_, owner, repo, ghsa] -> {owner, repo, ghsa}
+      _ -> nil
+    end
+  end
+
+  # Resolve the advisory to act on. An explicit URL wins (so the caller can name
+  # exactly which advisory); otherwise fall back to the record's vendor-advisory
+  # reference. Returns {owner, repo, ghsa, cna} (cna always comes from the record).
+  defp advisory_ref(content, url) do
+    cna = content |> JSON.decode!() |> get_in(["containers", "cna"])
+
+    target =
+      cond do
+        is_binary(url) and url != "" ->
+          parse_ghsa_url(url) || halt_fail("not a GitHub Security Advisory URL: #{url}")
+
+        true ->
+          (cna["references"] || [])
+          |> Enum.map(&to_string(&1["url"]))
+          |> Enum.find_value(&parse_ghsa_url/1) ||
+            halt_fail("no GitHub Security Advisory (GHSA) reference in the record; pass the advisory URL explicitly")
+      end
+
+    {owner, repo, ghsa} = target
+    {owner, repo, ghsa, cna}
+  end
+
+  # The advisory URL implied by a record's GHSA reference, so `update` can run
+  # with just a CVE id. Halts (via advisory_ref) if the record has no GHSA ref.
+  defp advisory_url_from_record(content) do
+    {owner, repo, ghsa, _cna} = advisory_ref(content, nil)
+    "https://github.com/#{owner}/#{repo}/security/advisories/#{ghsa}"
+  end
+
+  defp cna_cvss_vector(cna),
+    do: Enum.find_value(cna["metrics"] || [], fn m -> get_in(m, ["cvssV4_0", "vectorString"]) end)
+
+  defp cna_cwe_ids(cna) do
+    (cna["problemTypes"] || [])
+    |> Enum.flat_map(fn pt -> pt["descriptions"] || [] end)
+    |> Enum.flat_map(fn d ->
+      cond do
+        is_binary(d["cweId"]) and d["cweId"] != "" -> [d["cweId"]]
+        is_binary(d["description"]) -> Regex.scan(~r/CWE-\d+/, d["description"]) |> List.flatten()
+        true -> []
+      end
+    end)
+    |> Enum.uniq()
+  end
+
+  # Read the current advisory JSON (for before/after comparison and the original
+  # description). Uses the API version from the docs the user referenced.
+  defp fetch_advisory(owner, repo, ghsa) do
+    case System.cmd("gh", ["api", "-H", "X-GitHub-Api-Version: 2026-03-10", "/repos/#{owner}/#{repo}/security-advisories/#{ghsa}"], stderr_to_stdout: true) do
+      {out, 0} -> JSON.decode!(out)
+      {out, _} -> IO.write(out); halt_fail("could not read advisory #{ghsa} (not a collaborator, or wrong id?)")
+    end
+  end
+
+  # PATCH the advisory. `fields` is a list of {key, value}; array fields use the
+  # gh `key[]=value` syntax (repeat the key). Values are passed as args (no shell),
+  # so multi-line markdown descriptions are safe.
+  defp patch_advisory(owner, repo, ghsa, fields) do
+    args =
+      ["api", "--method", "PATCH",
+       "-H", "Accept: application/vnd.github+json",
+       "-H", "X-GitHub-Api-Version: 2026-03-10",
+       "/repos/#{owner}/#{repo}/security-advisories/#{ghsa}"] ++
+        Enum.flat_map(fields, fn {k, v} -> ["-f", "#{k}=#{v}"] end)
+
+    case System.cmd("gh", args, stderr_to_stdout: true) do
+      {out, 0} ->
+        sev = case JSON.decode(out) do
+          {:ok, m} -> m["severity"]
+          _ -> nil
+        end
+
+        info("applied PATCH to #{ghsa}" <> if(sev, do: " (severity now #{String.upcase(to_string(sev))})", else: ""))
+
+      {out, code} ->
+        IO.write(out)
+        halt_fail("gh api PATCH failed (#{code})")
+    end
+  end
+
+  # Either PATCH the advisory (--apply) or print the equivalent gh command.
+  # `fields` carry the real values; `display` is the dry-run-friendly variant
+  # (e.g. a description shown as its temp-file path instead of the full body).
+  defp apply_or_preview(st, owner, repo, ghsa, fields, display) do
+    if st.apply do
+      patch_advisory(owner, repo, ghsa, fields)
+    else
+      print_gh_preview(owner, repo, ghsa, display)
+    end
+  end
+
+  # Print the equivalent gh command for a dry run. `display` is a list of
+  # {key, shown_value} (description shows its temp-file path, not the full body).
+  defp print_gh_preview(owner, repo, ghsa, display) do
+    lines =
+      ["gh api --method PATCH",
+       "-H 'Accept: application/vnd.github+json'",
+       "-H 'X-GitHub-Api-Version: 2026-03-10'",
+       "/repos/#{owner}/#{repo}/security-advisories/#{ghsa}"] ++
+        Enum.map(display, fn {k, v} -> "-f '#{k}=#{v}'" end)
+
+    IO.puts("\n[dry-run] would run:")
+    IO.puts("  " <> Enum.join(lines, " \\\n  "))
+    IO.puts("\nre-run with --apply to PATCH the advisory")
+  end
+
+  # Print the advisory's current description verbatim, framed for copying into a
+  # comment titled "Original report" before it is overwritten.
+  defp print_original_report(""), do: info("advisory has no existing description to preserve")
+
+  defp print_original_report(original) do
+    bar = String.duplicate("=", 85)
+    IO.puts("\n#{bar}")
+    IO.puts("# Original report")
+    IO.puts(bar <> "\n")
+    IO.puts(original)
+    IO.puts("\n#{bar}\n")
+  end
+
+  # Build the new advisory description: print the original (for the "Original
+  # report" comment), generate it via /summarize-cve (or reuse/edit the temp file),
+  # strip any title down to "### Summary", and print it. Returns {new_desc, path}.
+  defp prepare_description(id, adv, st) do
+    print_original_report(adv["description"] || "")
+    summary_path = "/tmp/cve-summary-#{id}.md"
+
+    cond do
+      File.exists?(summary_path) ->
+        info("using existing summary #{summary_path} (delete it to regenerate)")
+
+      claude_available?(st) ->
+        info("generating description via /summarize-cve (headless)...")
+        run_skill_headless(st, "/summarize-cve #{record_path(id)} -- write #{summary_path} but do NOT open it in an editor (no `code`/editor command), and start the output at the `### Summary` heading with no title above it; it will be read from disk")
+
+      true ->
+        halt_fail("/summarize-cve needs the claude CLI; or write #{summary_path} yourself, then re-run")
+    end
+
+    unless File.exists?(summary_path), do: halt_fail("/summarize-cve did not produce #{summary_path}")
+
+    # Drop any title/preamble; the advisory description must start at "### Summary".
+    # Normalize the file so the preview, the apply, and what the user edits agree.
+    new_desc = summary_path |> File.read!() |> strip_to_summary()
+    File.write!(summary_path, new_desc)
+    if String.contains?(new_desc, "TODO"), do: error("warning: #{summary_path} still has TODO placeholders, review/edit it before --apply")
+    print_new_description(new_desc, summary_path)
+    {new_desc, summary_path}
+  end
+
+  # Trim anything before the first "### Summary" heading so the advisory
+  # description starts there (no title/preamble). No-op once already clean.
+  defp strip_to_summary(desc) do
+    case :binary.match(desc, "### Summary") do
+      {pos, _} -> binary_part(desc, pos, byte_size(desc) - pos) |> String.trim() |> Kernel.<>("\n")
+      :nomatch -> String.trim(desc) <> "\n"
+    end
+  end
+
+  # Print the generated description verbatim so it can be reviewed (and copied)
+  # straight from the terminal, instead of being opened in an editor.
+  defp print_new_description(desc, path) do
+    bar = String.duplicate("=", 85)
+    IO.puts("\n#{bar}")
+    IO.puts("New description (#{path}, #{byte_size(desc)} bytes) — to be set on the advisory")
+    IO.puts(bar <> "\n")
+    IO.puts(desc)
+    IO.puts("\n#{bar}\n")
+  end
+
+  # ---- 0.3  claim the ID (remove the reservation) ---------------------------
+  defp claim_reservation(id) do
+    res = reservation_path(id)
+
+    if File.exists?(res) do
+      File.rm!(res)
+      info("0.3  claimed ID, removed #{res}")
+    else
+      info("0.3  reservation already removed")
+    end
+  end
+
+  # ---- 0.4  format + schema + lint ------------------------------------------
+  # Returns :ok if every gating check passed, else :error.
+  defp validate_record(id, st) do
+    path = record_path(id)
+
+    results = [
+      format_check(),
+      schema_check(path),
+      cvelint_check(path),
+      verify_skill_check(path, st)
+    ]
+
+    if Enum.all?(results), do: :ok, else: :error
+  end
+
+  defp format_check do
+    case System.cmd(script("cve-formatter"), ["format"], stderr_to_stdout: true) do
+      {_, 0} -> info("0.4a format: applied/clean")
+      {out, _} -> IO.write(out); info("0.4a format reported an error")
+    end
+
+    true
+  end
+
+  defp schema_check(path) do
+    {out, status} = System.cmd(script("cve-schema-validate"), ["validate", path], stderr_to_stdout: true)
+    IO.write(out)
+
+    if status == 0 do
+      info("0.4b schema: valid")
+      true
+    else
+      error("0.4b schema: invalid (expected while TODOs remain)")
+      false
+    end
+  end
+
+  # cvelint runs only on the record being filed (so pre-existing issues in
+  # unrelated records do not block us). E007 and E015 are ignored: E015 is a
+  # false positive, this cvelint build checks for `cveMetadata.id` but the schema
+  # field is `cveId`, so every valid record trips it. Missing cvelint is a hard
+  # stop (do not fall back to a filesystem search).
+  defp cvelint_check(path) do
+    if System.find_executable("cvelint") do
+      {out, status} = System.cmd("cvelint", ["-ignore", "E007,E015", path], stderr_to_stdout: true)
+      IO.write(out)
+
+      if status == 0 do
+        info("0.4c cvelint: clean")
+        true
+      else
+        error("0.4c cvelint: issues (above)")
+        false
+      end
+    else
+      error("0.4c cvelint not installed, stopping. Install it (e.g. into ~/.local/bin) and re-run.")
+      false
+    end
+  end
+
+  # The /verify skill is the deep convention pass. Skip it on an unfilled stub
+  # (no point burning a claude run) and when --no-claude is set.
+  defp verify_skill_check(path, st) do
+    cond do
+      has_todos?(path) ->
+        info("0.4d /verify skill skipped, record still has TODO placeholders; fill it first")
+        true
+
+      claude_available?(st) ->
+        info("  -> 0.4d running /verify skill (convention review, read its report below)...")
+        # NOTE: claude -p exits 0 when the run completes; the exit code does NOT
+        # encode the pass/fail verdict. Read the report; rely on 0.4a-c for the gate.
+        if run_skill_headless(st, "/verify #{path}") do
+          info("0.4d /verify review done, read its verdict above (its exit code does not reflect pass/fail)")
+          true
+        else
+          error("0.4d /verify did not complete")
+          false
+        end
+
+      true ->
+        info("0.4d /verify skill skipped (claude unavailable or --no-claude), run /verify in Claude for the convention pass")
+        true
+    end
+  end
+
+  # ---- PR title -------------------------------------------------------------
+  # "Add {cve} ({package} / {module or identifier})".
+  # package    = the registry entry's product, else the packageURL's package name.
+  # identifier = the first affected module, else the CWE name. Override with --label.
+  defp pr_title(id, content, st) do
+    cond do
+      is_binary(st.pr_label) and st.pr_label != "" -> "Add #{id} (#{st.pr_label})"
+      true -> derive_title(id, content)
+    end
+  end
+
+  defp derive_title(id, content) do
+    cna = content |> JSON.decode!() |> Map.fetch!("containers") |> Map.fetch!("cna")
+    aff = cna["affected"] || []
+
+    pick =
+      Enum.find(aff, fn a ->
+        String.starts_with?(to_string(a["packageURL"]), ["pkg:hex/", "pkg:otp/", "pkg:sid/"])
+      end) || List.first(aff) || %{}
+
+    pkg =
+      case pick["product"] do
+        p when is_binary(p) and p != "" and p != "n/a" -> p
+        _ -> pkg_from_purl(to_string(pick["packageURL"] || ""))
+      end
+
+    ident =
+      case pick["modules"] do
+        [m | _] when is_binary(m) -> m
+        _ -> cwe_name(cna)
+      end
+
+    paren =
+      cond do
+        pkg != "" and ident != "" -> "#{pkg} / #{ident}"
+        pkg != "" -> pkg
+        true -> ident
+      end
+
+    if paren != "", do: "Add #{id} (#{paren})", else: "Add #{id}"
+  end
+
+  defp pkg_from_purl(purl) do
+    case Regex.run(~r{^pkg:[^/]+/(.+)}, purl) do
+      [_, rest] -> rest |> String.split(["@", "?"]) |> List.first() |> String.split("/") |> List.last()
+      _ -> ""
+    end
+  end
+
+  defp cwe_name(cna) do
+    (cna["problemTypes"] || [])
+    |> Enum.flat_map(fn pt -> pt["descriptions"] || [] end)
+    |> Enum.find_value("", fn de ->
+      case de["description"] do
+        d when is_binary(d) and d != "" -> Regex.replace(~r/^CWE-\d+\s+/, d, "")
+        _ -> nil
+      end
+    end)
+  end
+
+  # ---- 0.5  open the PR -----------------------------------------------------
+  defp open_pr(id, st) do
+    path = record_path(id)
+    # Prefer an existing PR branch (a coworker's `<initials>/<id>`, or our own
+    # `cve/<id>` from a prior run) so the push updates that PR; else file fresh
+    # under `cve/<id>`.
+    branch = resolve_branch(id)
+    fetch_main_once()
+
+    # Source the record. Normally it sits (authored, uncommitted) in this
+    # checkout, so format it in place and read it. cve-formatter resolves files
+    # via its own location, not cwd, so it must run here and cannot run in the
+    # worktree. On a re-run after the record has already moved to its branch,
+    # read it back from there.
+    {content, from_working_tree} =
+      cond do
+        File.exists?(path) ->
+          System.cmd(script("cve-formatter"), ["format"], stderr_to_stdout: true)
+          {File.read!(path), true}
+
+        git_ok?(["rev-parse", "--verify", "-q", branch]) ->
+          {git_show("#{branch}:#{path}") || halt_fail("cannot read #{path} from #{branch}"), false}
+
+        true ->
+          halt_fail("No record to submit: #{path} (run prepare first)")
+      end
+
+    # A record with TODO placeholders (e.g. an unreleased fix version in
+    # `lessThan`) is a preview -> draft PR, unless overridden.
+    draft =
+      case st.pr_mode do
+        "draft" -> true
+        "ready" -> false
+        _ -> String.contains?(content, "TODO")
+      end
+
+    title = pr_title(id, content, st)
+    body = pr_body(id, draft)
+
+    # All branch/commit/push work happens in a dedicated worktree, so parallel
+    # `pr` runs never switch the shared checkout's branch out from under each
+    # other. The branch persists (it is pushed); the worktree is disposable.
+    {wt, ephemeral} = checkout_pr_worktree(id, branch)
+
+    commit_record(wt, id, content, title)
+    push_branch(wt, branch)
+    submit_pr(branch, title, body, draft)
+
+    if ephemeral do
+      System.cmd("git", ["worktree", "remove", "--force", wt], stderr_to_stdout: true)
+      # The record now lives in branch #{branch}; return this checkout to a clean
+      # main, the way the old `git switch -c` carried the changes onto the branch.
+      if from_working_tree, do: restore_clean_tree(id)
+    end
+  end
+
+  # Check out `branch` in an isolated worktree. Reuse one if the branch is
+  # already checked out somewhere (git forbids a second checkout of the same
+  # branch); otherwise create a fresh, disposable worktree under the temp dir.
+  # Returns {worktree_path, ephemeral?}.
+  defp checkout_pr_worktree(id, branch) do
+    case worktree_on_branch(branch) do
+      wt when is_binary(wt) ->
+        info("0.5a reusing worktree on #{branch}: #{wt}")
+        {wt, false}
+
+      nil ->
+        wt = Path.join([System.tmp_dir!() || "/tmp", "file-cve-pr", id])
+        # Clear a stale worktree left by an aborted run.
+        if File.dir?(wt), do: System.cmd("git", ["worktree", "remove", "--force", wt], stderr_to_stdout: true)
+        System.cmd("git", ["worktree", "prune"], stderr_to_stdout: true)
+        File.mkdir_p!(Path.dirname(wt))
+        add_worktree(wt, branch)
+        info("0.5a isolated worktree on #{branch}: #{wt}")
+        {wt, true}
+    end
+  end
+
+  defp add_worktree(wt, branch) do
+    cond do
+      git_ok?(["show-ref", "--verify", "--quiet", "refs/heads/#{branch}"]) ->
+        git!(["worktree", "add", "-q", wt, branch])
+
+      git_ok?(["show-ref", "--verify", "--quiet", "refs/remotes/origin/#{branch}"]) ->
+        git!(["worktree", "add", "-q", "-b", branch, wt, "origin/#{branch}"])
+
+      true ->
+        base = if git_ok?(["rev-parse", "--verify", "-q", "origin/main"]), do: "origin/main", else: "main"
+        git!(["worktree", "add", "-q", "-b", branch, wt, base])
+    end
+  end
+
+  # Absolute path of the worktree that currently has `branch` checked out, or nil.
+  defp worktree_on_branch(branch) do
+    case System.cmd("git", ["worktree", "list", "--porcelain"], stderr_to_stdout: true) do
+      {out, 0} ->
+        out
+        |> String.split("\n\n", trim: true)
+        |> Enum.find_value(fn block ->
+          lines = String.split(block, "\n", trim: true)
+
+          path =
+            Enum.find_value(lines, fn
+              "worktree " <> p -> p
+              _ -> nil
+            end)
+
+          ref =
+            Enum.find_value(lines, fn
+              "branch " <> b -> b
+              _ -> nil
+            end)
+
+          if ref == "refs/heads/#{branch}", do: path, else: nil
+        end)
+
+      _ ->
+        nil
+    end
+  end
+
+  # Materialize the record (our content) and the reservation deletion in the
+  # worktree, then commit. `git add -A` stages the new record and, because the
+  # reservation file is removed from disk, its deletion too.
+  defp commit_record(wt, id, content, title) do
+    path = record_path(id)
+    res = reservation_path(id)
+
+    File.mkdir_p!(Path.join(wt, Path.dirname(path)))
+    File.write!(Path.join(wt, path), content)
+
+    # Claim the reservation by removing it, but only hand `res` to `git add` when
+    # it is actually tracked at the worktree HEAD. On an idempotent `pr` re-run the
+    # branch already dropped the reservation, so the pathspec would match nothing
+    # and `git add` would fatal (128).
+    res_in_wt = Path.join(wt, res)
+    res_tracked = git_wt_ok?(wt, ["cat-file", "-e", "HEAD:" <> res])
+    if File.exists?(res_in_wt), do: File.rm!(res_in_wt)
+
+    pathspecs = if res_tracked, do: [path, res], else: [path]
+    git_wt!(wt, ["add", "-A", "--"] ++ pathspecs)
+
+    if git_wt_ok?(wt, ["diff", "--cached", "--quiet"]) do
+      info("0.5b nothing new to commit")
+    else
+      git_wt!(wt, ["commit", "-q", "-m", title]); info("0.5b committed: #{title}")
+    end
+  end
+
+  defp push_branch(wt, branch) do
+    if git_wt_ok?(wt, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) do
+      git_wt!(wt, ["push", "-q"]); info("0.5c pushed")
+    else
+      git_wt!(wt, ["push", "-q", "-u", "origin", branch]); info("0.5c pushed #{branch}")
+    end
+  end
+
+  # gh queries are repo-global (cwd only selects the repo, which the worktree and
+  # this checkout share), so these run fine from the current directory.
+  defp submit_pr(branch, title, body, draft) do
+    cond do
+      pr_exists?(branch) ->
+        info("0.5d PR already open")
+        # Flip an existing draft to ready once the placeholders are gone.
+        if not draft and pr_is_draft?(branch) do
+          System.cmd("gh", ["pr", "ready", branch], stderr_to_stdout: true)
+          info("0.5d marked PR ready for review")
+        end
+
+        print_pr_url(branch)
+
+      draft ->
+        gh_pr_create(["--draft", "--base", "main", "--head", branch, "--title", title, "--body", body])
+        info("0.5d opened draft PR (preview): #{title}")
+
+      true ->
+        gh_pr_create(["--base", "main", "--head", branch, "--title", title, "--body", body])
+        info("0.5d opened PR: #{title}")
+    end
+  end
+
+  # Return this checkout to a clean main: drop the now-moved record (untracked
+  # for a new CVE) and restore the reservation the authoring step removed.
+  defp restore_clean_tree(id) do
+    path = record_path(id)
+    res = reservation_path(id)
+
+    if File.exists?(path) do
+      if git_ok?(["ls-files", "--error-unmatch", "--", path]),
+        do: git!(["checkout", "--", path]),
+        else: File.rm!(path)
+    end
+
+    if not File.exists?(res) and git_ok?(["cat-file", "-e", "HEAD:" <> res]) do
+      git!(["checkout", "--", res])
+    end
+
+    info("0.5e working tree restored to clean main (record now lives in branch cve/#{id})")
+  end
+
+  defp pr_body(id, draft) do
+    base = "Files #{id}."
+
+    if draft do
+      base <>
+        "\n\n> **Preview, not ready to merge.** Still contains TODO placeholders " <>
+        "(e.g. the unreleased fix version in `lessThan`, patch URL). " <>
+        "Re-run `scripts/file-cve pr #{id}` once filled to mark it ready."
+    else
+      base
+    end
+  end
+
+  defp pr_exists?(branch), do: match?({_, 0}, System.cmd("gh", ["pr", "view", branch], stderr_to_stdout: true))
+
+  defp pr_is_draft?(branch) do
+    case System.cmd("gh", ["pr", "view", branch, "--json", "isDraft", "--jq", ".isDraft"], stderr_to_stdout: true) do
+      {out, 0} -> String.trim(out) == "true"
+      _ -> false
+    end
+  end
+
+  defp print_pr_url(branch) do
+    case System.cmd("gh", ["pr", "view", branch, "--json", "url", "--jq", ".url"], stderr_to_stdout: true) do
+      {out, 0} -> IO.write(out)
+      _ -> :ok
+    end
+  end
+
+  defp gh_pr_create(args) do
+    case System.cmd("gh", ["pr", "create" | args], stderr_to_stdout: true) do
+      {out, 0} -> IO.write(out)
+      {out, code} -> IO.write(out); halt_fail("gh pr create failed (#{code})")
+    end
+  end
+
+  # ---- switch: re-home a record onto a different CVE ID ---------------------
+  # Use when the chosen ID turned out to be taken (published upstream) or wrong.
+  # Copies OLD's record to NEW, rewriting every embedded ID (cveId plus the
+  # cna.erlef.org and osv.dev reference URLs), claims NEW, and releases OLD back
+  # to the pool if it is still reserved upstream. Stays local: run `pr` after.
+  defp switch_cve(old, new, st) do
+    unless valid_id?(old), do: halt_fail("Not a valid CVE ID: #{old}")
+    if old == new, do: halt_fail("OLD and NEW ids are the same (#{old})")
+
+    oldpath = record_path(old)
+    newpath = record_path(new)
+    if File.exists?(newpath), do: halt_fail("#{new} already has a record at #{newpath}")
+
+    fetch_main_once()
+    old_published = git_ok?(["cat-file", "-e", "origin/main:" <> oldpath])
+    cur_branch = git_out(["rev-parse", "--abbrev-ref", "HEAD"])
+
+    {content, src} = locate_old(old, oldpath, old_published, cur_branch, st)
+
+    if content == nil do
+      if old_published do
+        error("#{old} is published upstream, so its working-tree copy is that record, not your draft.")
+        error("  No draft branch cve/#{old} found. Re-run on your draft branch, or pass --from <ref>.")
+      else
+        error("could not find a record for #{old} (tried working tree, cve/#{old}, origin/cve/#{old}; or pass --from <ref>)")
+      end
+
+      System.halt(1)
+    end
+
+    # Sanity: the sourced record must actually be OLD (guards a wrong --from).
+    unless String.contains?(content, old), do: halt_fail("sourced record does not reference #{old}, wrong source? Aborting.")
+    info("sourced #{old} from #{src}")
+
+    File.mkdir_p!(Path.dirname(newpath))
+    File.write!(newpath, String.replace(content, old, new))
+    info("wrote #{newpath} (rewrote every #{old} to #{new})")
+
+    # Only delete the old file if it is the draft we just moved (sourced from the
+    # working tree). If we sourced from a branch, the working-tree oldpath is some
+    # other record (e.g. main's published one) and must be left alone.
+    cond do
+      src == "working tree" and File.exists?(oldpath) ->
+        File.rm!(oldpath); info("removed old record #{oldpath}")
+
+      File.exists?(oldpath) ->
+        info("left working-tree #{oldpath} untouched (not your draft; sourced from #{src})")
+
+      true ->
+        :ok
+    end
+
+    # Release OLD back to the pool only if it is still reserved upstream (a wrong
+    # pick); if it was already published, its reservation is gone and we skip.
+    if git_ok?(["cat-file", "-e", "origin/main:" <> reservation_path(old)]) do
+      case git_show("origin/main:" <> reservation_path(old)) do
+        nil -> :ok
+        out -> File.write!(reservation_path(old), out); info("released #{old} back to the reservation pool")
+      end
+    else
+      info("#{old} not reserved upstream (already consumed), nothing to release")
+    end
+
+    claim_reservation(new)
+    File.write!(st.state_file, new)
+  end
+
+  defp locate_old(old, oldpath, old_published, cur_branch, st) do
+    cond do
+      is_binary(st.from_ref) and st.from_ref != "" ->
+        case git_show("#{st.from_ref}:#{oldpath}") do
+          nil -> {nil, nil}
+          c -> {c, st.from_ref}
+        end
+
+      File.exists?(oldpath) and (not old_published or cur_branch == "cve/#{old}") ->
+        {File.read!(oldpath), "working tree"}
+
+      git_ok?(["rev-parse", "--verify", "-q", "cve/#{old}"]) ->
+        {git_show("cve/#{old}:#{oldpath}"), "cve/#{old}"}
+
+      git_ok?(["rev-parse", "--verify", "-q", "origin/cve/#{old}"]) ->
+        {git_show("origin/cve/#{old}:#{oldpath}"), "origin/cve/#{old}"}
+
+      true ->
+        {nil, nil}
+    end
+  end
+
+  # ---- usage ----------------------------------------------------------------
+  defp usage do
+    IO.puts(:stderr, """
+    Usage:
+      scripts/file-cve [prepare] [CVE-ID] [--advisory URL] [--no-claude]   # steps 0.1-0.4
+      scripts/file-cve draft     [CVE-ID] [--advisory URL]                 # step 0.2b only (/new-cve)
+      scripts/file-cve verify    [CVE-ID]                                  # step 0.4 only (raw checks + /verify)
+      scripts/file-cve pr        [CVE-ID] [--draft|--ready]                # step 0.5 (open the PR)
+      scripts/file-cve update    [CVE-ID] [URL]                           # reconcile a record with its advisory (URL defaults to the record's GHSA reference), then open/update its PR
+      scripts/file-cve update-cvss          [CVE-ID] "VECTOR"              # set the CVSS v4.0 metric from a vector string
+      scripts/file-cve update-advisory          [CVE-ID] [ADVISORY-URL] [--apply] [--no-description]   # push the record's CVSS + CWEs + description to the GitHub advisory
+      scripts/file-cve set-advisory-description [CVE-ID] [ADVISORY-URL] [--apply]         # set the advisory description from /summarize-cve (prints the original)
+      scripts/file-cve switch    OLD-ID [NEW-ID] [--from REF]              # re-home a record to a new ID
+      scripts/file-cve status                                              # show the working CVE ID
+
+    Flags:
+      --advisory URL   GHSA / advisory link fed to the /new-cve skill (0.2b)
+      --no-claude      do not shell out to the claude CLI for skill steps
+      --draft/--ready  force a preview (draft) or ready PR; default: draft iff TODOs remain
+      --label TEXT     (pr) override the title parenthetical -> "Add CVE-... (TEXT)"
+      --from REF       (switch) git ref to read OLD's record from; default: working tree / cve/OLD
+      --apply          (update-advisory / set-advisory-description) actually PATCH the advisory; default: preview only
+      --no-description    (update-advisory) skip the description; push only CVSS + CWEs
+
+    Env:
+      CLAUDE_BIN              claude binary to invoke (default: claude)
+      FILE_CVE_CLAUDE_PERM    permission mode (default: acceptEdits)
+    """)
+  end
+
+  # ---- entry point ----------------------------------------------------------
+  def main(argv) do
+    Mix.start()
+    root = git_out(["rev-parse", "--show-toplevel"]) || halt_fail("not inside a git repository")
+    File.cd!(root)
+    git_dir = git_out(["rev-parse", "--git-dir"]) || ".git"
+
+    {opts, rest, invalid} =
+      OptionParser.parse(argv,
+        strict: [
+          advisory: :string,
+          from: :string,
+          label: :string,
+          no_claude: :boolean,
+          draft: :boolean,
+          ready: :boolean,
+          apply: :boolean,
+          no_description: :boolean,
+          help: :boolean
+        ],
+        aliases: [h: :help]
+      )
+
+    unless invalid == [], do: (error("unknown option: #{inspect(invalid)}"); usage(); System.halt(1))
+    if opts[:help], do: (usage(); System.halt(0))
+
+    st = %{
+      claude_bin: System.get_env("CLAUDE_BIN") || "claude",
+      claude_perm: System.get_env("FILE_CVE_CLAUDE_PERM") || "acceptEdits",
+      use_claude: not Keyword.get(opts, :no_claude, false),
+      pr_mode: cond do
+        Keyword.get(opts, :draft) -> "draft"
+        Keyword.get(opts, :ready) -> "ready"
+        true -> "auto"
+      end,
+      from_ref: Keyword.get(opts, :from),
+      pr_label: Keyword.get(opts, :label),
+      apply: Keyword.get(opts, :apply, false),
+      with_description: not Keyword.get(opts, :no_description, false),
+      state_file: Path.join(git_dir, "cve-work-id")
+    }
+
+    advisory = Keyword.get(opts, :advisory)
+    {cmd, cve_args} = parse_command(rest)
+
+    # These commands take a free-form value (vector / URL) alongside an optional
+    # CVE id, so they validate their own args; everything else expects only CVE
+    # ids here.
+    unless cmd in ~w(update-cvss update update-advisory set-advisory-description) do
+      Enum.each(cve_args, fn a -> unless valid_id?(a), do: (error("Unexpected argument: #{a}"); usage(); System.halt(1)) end)
+    end
+
+    run(cmd, cve_args, advisory, st)
+  end
+
+  defp parse_command([]), do: (usage(); System.halt(0))
+
+  defp parse_command([first | tail] = all) do
+    cond do
+      first in ~w(prepare pr draft verify switch update update-cvss update-advisory set-advisory-description) -> {first, tail}
+      first == "update-from-advisory" -> {"update", tail}
+      first == "rehome" -> {"switch", tail}
+      first == "status" -> {"status", []}
+      valid_id?(first) -> {"prepare", all}
+      true -> (error("Unknown command: #{first}"); usage(); System.halt(1))
+    end
+  end
+
+  defp run("status", _args, _adv, st) do
+    saved = if File.exists?(st.state_file), do: String.trim(File.read!(st.state_file)), else: ""
+    if saved != "", do: IO.puts("Working CVE: #{saved}"), else: IO.puts("No working CVE yet.")
+  end
+
+  defp run("switch", args, _adv, st) do
+    old = Enum.at(args, 0) || halt_fail("switch needs an OLD id: scripts/file-cve switch <OLD> [NEW]")
+    new = Enum.at(args, 1) || pick_next_free()
+    if new in [nil, ""], do: halt_fail("no NEW id given and next-free-cve produced none")
+
+    step("Switch #{old} to #{new}")
+    assert_id_available(new)
+    switch_cve(old, new, st)
+    validate_record(new, st)
+
+    IO.puts(
+      "\nRe-homed to #{new}. Next:" <>
+        "\n  scripts/file-cve pr #{new}                  # open the preview PR" <>
+        "\n  gh pr close <old-PR#> --delete-branch       # retire the old #{old} PR"
+    )
+  end
+
+  defp run("pr", args, _adv, st) do
+    id = resolve_id(Enum.at(args, 0), st)
+    assert_id_available(id)
+    step("Step 0.5 - open PR for #{id}")
+    open_pr(id, st)
+  end
+
+  defp run("draft", args, advisory, st) do
+    id = resolve_id(Enum.at(args, 0), st)
+    assert_id_available(id)
+    step("Step 0.2b - draft content for #{id}")
+    draft_content(id, advisory, true, st)
+  end
+
+  defp run("verify", args, _adv, st) do
+    id = resolve_id(Enum.at(args, 0), st)
+    assert_id_available(id)
+    step("Step 0.4 - verify #{id}")
+
+    case validate_record(id, st) do
+      :ok ->
+        if has_todos?(record_path(id)),
+          do: info("0.4  schema + lint clean, but TODO placeholders remain, fill them before filing"),
+          else: info("0.4  all checks passed")
+
+      :error ->
+        error("0.4  checks failed, fix the errors above before filing")
+        System.halt(1)
+    end
+  end
+
+  defp run("update-cvss", args, _adv, st) do
+    {maybe_id, vector} = split_id_and_value(args)
+    unless is_binary(vector) and vector != "", do: halt_fail("update-cvss needs a CVSS v4.0 vector: scripts/file-cve update-cvss \"CVSS:4.0/AV:N/...\"")
+    id = update_target_id(maybe_id, st)
+    step("Update CVSS for #{id}")
+    base = materialize_base!(id)
+    update_cvss(id, base, vector)
+
+    case validate_record(id, st) do
+      :ok -> submit_hint(id)
+      :error -> (error("update-cvss: validation failed, see above"); System.halt(1))
+    end
+  end
+
+  defp run("update", args, advisory, st) do
+    {maybe_id, positional} = split_id_and_value(args)
+    id = update_target_id(maybe_id, st)
+    base = materialize_base!(id)
+    # URL precedence: --advisory flag, then a positional URL, then the advisory
+    # the record already references (so `update [CVE-ID]` works on its own).
+    url = advisory || positional || advisory_url_from_record(base)
+    step("Update #{id} from advisory #{url}")
+    update_from_advisory(id, url, st)
+
+    # Reconciling done; carry it straight through to the PR (open or update it).
+    assert_id_available(id)
+    step("Step 0.5 - open PR for #{id}")
+    open_pr(id, st)
+  end
+
+  defp run("update-advisory", args, advisory, st) do
+    {maybe_id, url} = split_id_and_value(args)
+    url = advisory || url
+    id = update_target_id(maybe_id, st)
+    with_desc = st.with_description
+    step("Push #{id} CVSS + CWEs#{if with_desc, do: " + description", else: ""} to its GitHub advisory")
+
+    # The description path needs the record on disk for /summarize-cve; the metrics
+    # path only needs to read it.
+    base = if with_desc, do: materialize_base!(id), else: read_record_base(id) || halt_fail("no record found for #{id}")
+    {owner, repo, ghsa, cna} = advisory_ref(base, url)
+    vector = cna_cvss_vector(cna) || halt_fail("no CVSS v4.0 vector in #{id}'s record (run update-cvss first)")
+    cwes = cna_cwe_ids(cna)
+    if cwes == [], do: error("note: #{id}'s record has no CWE; only CVSS will be set")
+
+    adv = fetch_advisory(owner, repo, ghsa)
+    info("advisory: #{owner}/#{repo} #{ghsa}")
+    info("  CVSS before: #{get_in(adv, ["cvss_severities", "cvss_v4", "vector_string"]) || "(none)"}")
+    info("  CVSS after:  #{vector}")
+    info("  CWEs before: #{Enum.join(adv["cwe_ids"] || [], ", ")}")
+    info("  CWEs after:  #{Enum.join(cwes, ", ")}")
+
+    metric_fields = [{"cvss_vector_string", vector}] ++ Enum.map(cwes, &{"cwe_ids[]", &1})
+
+    # Fold an optional description update into the same PATCH. `display` swaps the
+    # full description body for its temp-file path in the dry-run preview.
+    {fields, display} =
+      if with_desc do
+        {new_desc, summary_path} = prepare_description(id, adv, st)
+        {metric_fields ++ [{"description", new_desc}], metric_fields ++ [{"description", "@#{summary_path}"}]}
+      else
+        {metric_fields, metric_fields}
+      end
+
+    apply_or_preview(st, owner, repo, ghsa, fields, display)
+  end
+
+  defp run("set-advisory-description", args, advisory, st) do
+    {maybe_id, url} = split_id_and_value(args)
+    url = advisory || url
+    id = update_target_id(maybe_id, st)
+    step("Set #{id}'s GitHub advisory description")
+    base = materialize_base!(id)
+    {owner, repo, ghsa, _cna} = advisory_ref(base, url)
+    adv = fetch_advisory(owner, repo, ghsa)
+    {new_desc, summary_path} = prepare_description(id, adv, st)
+    apply_or_preview(st, owner, repo, ghsa, [{"description", new_desc}], [{"description", "@#{summary_path}"}])
+  end
+
+  defp run("prepare", args, advisory, st) do
+    id = resolve_id(Enum.at(args, 0), st)
+    assert_id_available(id)
+    step("Steps 0.1-0.4 for #{id}")
+    info("0.1  working CVE: #{id}")
+    scaffold_record(id)
+    drafted = draft_content(id, advisory, false, st)
+
+    # When /new-cve ran to completion it already deleted the reservation (its
+    # Step 6) and ran /verify (Step 7), so we do not repeat 0.3/0.4. A leftover
+    # reservation means the skill was aborted, so we fall back to the full path.
+    if drafted == :ran and not File.exists?(reservation_path(id)) do
+      info("0.3  reservation claimed by /new-cve")
+      info("0.4  validation done by /new-cve's /verify (see its report above)")
+      IO.puts("\n/new-cve drafted, claimed, and verified #{id}. When ready, open the PR:\n  scripts/file-cve pr #{id}")
+    else
+      claim_reservation(id)
+      finish_prepare(id, validate_record(id, st))
+    end
+  end
+
+  defp finish_prepare(id, :ok) do
+    if has_todos?(record_path(id)) do
+      IO.puts(
+        "\nSchema + lint pass, but TODO placeholders remain. Fill them, then:" <>
+          "\n  scripts/file-cve verify #{id}   # full /verify convention pass" <>
+          "\n  scripts/file-cve pr #{id}"
+      )
+    else
+      IO.puts("\nAll checks passed. Submit with:\n  scripts/file-cve pr #{id}")
+    end
+  end
+
+  defp finish_prepare(_id, :error) do
+    error("Validation failed, fix the errors above, then re-run (it is idempotent and resumes).")
+    System.halt(1)
+  end
+end
+
+FileCVE.main(System.argv())

@@ -57,6 +57,15 @@ Narrow the range to before the fix:
 git log --oneline <fix-sha> -S '<fragment>' -- <programFile>
 ```
 
+**Follow renames.** If the result looks like a refactor (e.g. a commit message about "move", "split", "extract", or a date that postdates known affected releases), the vulnerable code likely existed at an earlier path. Re-run the search with `--follow` or drop the path filter entirely:
+
+```bash
+git log --oneline --follow -S '<fragment>' -- <programFile>
+
+# Or search across all paths
+git log --oneline -S '<fragment>'
+```
+
 ### 5. If a hint version was provided
 
 Check out or inspect the tagged release to see if the vulnerable code is already present:

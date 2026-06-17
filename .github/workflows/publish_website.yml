@@ -38,31 +38,31 @@ jobs:
         shell: bash
         run: |
           mkdir -p \
-            website/_data/cves-staging && \
+            website/_data/cves && \
           find records \
             -path 'records/reservations' -prune \
           -or \
             -type f -name '*.json' \
-            -exec cp -f {} website/_data/cves-staging/ \; && \
+            -exec cp -f {} website/_data/cves/ \; && \
           mkdir -p \
-            website/_data/osv-staging && \
+            website/_data/osv && \
           find osv \
             -type f -name '*.json' \
-            -exec cp -f {} website/_data/osv-staging/ \;
+            -exec cp -f {} website/_data/osv/ \;
       - name: Create or update CVE-data PR
         id: cpr
         uses: peter-evans/create-pull-request@v8
         with:
           path: website
           token: ${{ steps.website-app-token.outputs.token }}
-          commit-message: "chore(data): sync Staging CVE JSON from records/"
+          commit-message: "chore(data): sync CVE JSON from records/"
           title: "Automated CVE data update"
           body: |
             This PR copies the latest JSON files from **records/** into
-            **_data/cves-staging/** and **osv/** to **_data/osv-staging/** so
+            **_data/cves/** and **osv/** to **_data/osv/** so
             the website stays in sync.
           labels: automated
-          branch: cve-staging-data-sync
+          branch: cve-data-sync
           delete-branch: true
           base: main
       - name: Print PR link
