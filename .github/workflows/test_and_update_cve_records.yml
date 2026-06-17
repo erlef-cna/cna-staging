@@ -19,6 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     if: "${{ vars.CNA_BOT_APP_ID }}"
     steps:
+      - name: Install Elixir
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        with:
+          elixir-version: '1.20.1'
+          otp-version: '29.0.2'
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -28,6 +33,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           token: ${{ steps.app-token.outputs.token }}
+      - name: Generate reservations lock from open PRs
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: './scripts/generate-reservations-lock'
       - name: CVE RSUS check and upload
         # TODO: Switch back to upstream once PRs are merged
         uses: erlef-cna/cna-bot@main
@@ -48,12 +58,6 @@ jobs:
           # We also allow 3rd party advisories in case of unresponsive hex.pm
           # package maintainers
           ignore: "vendor-advisory"
-      - name: Install Elixir
-        if: github.ref == 'refs/heads/main'
-        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
-        with:
-          elixir-version: '1.18.4'
-          otp-version: '27.3.4.1'
       - name: Convert all CVE files to OSV format
         if: github.ref == 'refs/heads/main'
         run: './scripts/cve-to-osv convert-all'

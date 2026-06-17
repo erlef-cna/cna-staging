@@ -1,0 +1,70 @@
+#!/usr/bin/env elixir
+
+# Generates records/reservations.lock from open PRs.
+# Lists CVE IDs referenced by files in open pull requests so cna-bot
+# knows they are in use and does not count them toward min-reserved.
+
+defmodule GenerateReservationsLock do
+  @lock_file Path.expand("../records/reservations/reservations.lock", __DIR__)
+
+  def run do
+    ids = claimed_ids_in_prs()
+
+    content =
+      ["# Auto-generated — CVE IDs referenced by open PRs" | Enum.sort(ids)]
+      |> Enum.join("\n")
+      |> Kernel.<>("\n")
+
+    File.write!(@lock_file, content)
+
+    IO.puts("Wrote #{@lock_file} (#{length(ids)} IDs)")
+  end
+
+  defp claimed_ids_in_prs do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "list",
+        "--repo", repo(),
+        "--state", "open",
+        "--json", "number",
+        "--limit", "500"
+      ])
+
+    pr_numbers =
+      output
+      |> JSON.decode!()
+      |> Enum.map(& &1["number"])
+
+    pr_numbers
+    |> Task.async_stream(&pr_cve_ids/1, timeout: 30_000)
+    |> Enum.flat_map(fn {:ok, ids} -> ids end)
+    |> Enum.uniq()
+  end
+
+  defp pr_cve_ids(pr_number) do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "view", Integer.to_string(pr_number),
+        "--repo", repo(),
+        "--json", "files"
+      ])
+
+    output
+    |> JSON.decode!()
+    |> Map.fetch!("files")
+    |> Enum.map(& &1["path"])
+    |> Enum.flat_map(fn path ->
+      case Regex.run(~r/(CVE-\d{4}-\d+)\.json$/, path) do
+        [_, id] -> [id]
+        nil -> []
+      end
+    end)
+  end
+
+  defp repo do
+    {output, 0} = System.cmd("gh", ["repo", "view", "--json", "nameWithOwner"])
+    output |> JSON.decode!() |> Map.fetch!("nameWithOwner")
+  end
+end
+
+GenerateReservationsLock.run()
