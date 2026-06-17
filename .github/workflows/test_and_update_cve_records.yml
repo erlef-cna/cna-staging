@@ -26,8 +26,9 @@ jobs:
           app-id: ${{ vars.CNA_BOT_APP_ID }}
           private-key: ${{ secrets.CNA_BOT_PRIVATE_KEY }}
       - name: CVE RSUS check and upload
-        uses: DIVD-NL/cna-bot@32b2dcdec099a157714ba9963572d22c62f70934 # v1.7.0
-        with: 
+        # TODO: Switch back to upstream once PRs are merged
+        uses: erlef-cna/cna-bot@main
+        with:
           cve-user: ${{ secrets.CVE_USER }}
           cve-org: ${{ secrets.CVE_ORG }}
           cve-api-key: ${{ secrets.CVE_API_KEY }}
@@ -40,6 +41,7 @@ jobs:
           pr: ${{ github.event_name != 'pull_request' }}
           github-token: ${{ steps.app-token.outputs.token }}
           expire-after: "1y"
+          delete-rejected: true
           # We also allow 3rd party advisories in case of unresponsive hex.pm
           # package maintainers
           ignore: "vendor-advisory"
