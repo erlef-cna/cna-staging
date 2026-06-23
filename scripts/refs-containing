@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# refs-containing - list every tag and branch in a remote git repo that
+# contains a given commit. Uses a persistent blob-less bare clone under
+# $XDG_CACHE_HOME/cna/refs-containing/<sha256(repo-url)> so repeated runs
+# only fetch the delta. Only commit/tree metadata is downloaded, not blobs.
+#
+# Usage:
+#   scripts/refs-containing <repo-url> <sha>
+#
+# Output (one per line, in this order):
+#   tag:<name>
+#   branch:<name>
+
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 <repo-url> <sha>" >&2
+  exit 1
+fi
+
+repo="$1"
+sha="$2"
+
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/cna/refs-containing"
+repo_hash="$(printf '%s' "$repo" | shasum -a 256 | awk '{print $1}')"
+cache="$cache_root/$repo_hash"
+lockdir="$cache_root/$repo_hash.lock"
+
+mkdir -p "$cache_root"
+
+# Serialize init+fetch for the same repo so concurrent invocations do not race
+# on git's own lockfiles. `mkdir` is atomic across POSIX systems, which lets us
+# avoid the flock(1) dependency (not shipped on macOS).
+while ! mkdir "$lockdir" 2>/dev/null; do
+  sleep 0.2
+done
+trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
+
+if [ ! -d "$cache" ]; then
+  git init --bare -q "$cache"
+  git -C "$cache" remote add origin "$repo"
+fi
+
+# blob:none keeps the fetch lightweight (commit + tree metadata only). Fetch
+# tags explicitly and every branch head so `--contains` can answer for both.
+# Prune so deleted upstream refs do not linger in the persistent cache.
+git -C "$cache" fetch -q \
+  --filter=blob:none \
+  --tags --prune --prune-tags \
+  origin \
+  '+refs/heads/*:refs/remotes/origin/*'
+
+if ! git -C "$cache" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+  echo "error: commit $sha not found in $repo" >&2
+  exit 2
+fi
+
+git -C "$cache" tag --contains "$sha" | sed 's/^/tag:/'
+
+git -C "$cache" for-each-ref \
+  --format='%(refname:short)' \
+  --contains="$sha" \
+  refs/remotes/origin \
+  | sed 's|^origin/||; s/^/branch:/'

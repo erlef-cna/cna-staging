@@ -74,7 +74,28 @@ Use that ID directly.
 
 Create the record at `records/<year>/<CVE-ID>.json` following all conventions from CLAUDE.md.
 
-Key things to get right:
+### Generating `affected` and `cpeApplicability` for erlang/otp and elixir-lang/elixir
+
+For CVEs in `erlang/otp` or `elixir-lang/elixir`, you **must** generate the `affected` and `cpeApplicability` blocks with `scripts/gen-affected` rather than writing them by hand. The script handles intro/fix release lookup, per-major or per-minor chaining of cpeApplicability ranges, single vs multi-fix shape, programFiles path stripping, packageURL formatting, and CPE wiring.
+
+```bash
+scripts/gen-affected <erlang|elixir> \
+  --intro <intro-SHA-from-/find-intro-commit> \
+  [--fix <fix-SHA>]... \
+  --path <repo-relative-path> [--path ...] \
+  [--module <name>]... \
+  [--routine '<module:fun/arity>']...
+```
+
+Notes:
+- `--path` is the repo-relative source path (e.g. `lib/ssh/src/ssh_auth.erl`, `lib/elixir/lib/version.ex`). The script derives the OTP app or Elixir sub-app from the path and strips the prefix for the library-relative entry.
+- Pass each affected `--module` and `--routine` exactly as it should appear in the record (Elixir modules need the `'Elixir.ModuleName'` atom prefix; routines use `module:function/arity`).
+- Multiple `--fix` SHAs are allowed (one per maintained release line). Omit `--fix` entirely when no patch is published yet; the script emits `TODO<major>` (or a single `TODO` for Elixir) so the record validates while the fix is pending.
+- Output is a JSON object with `affected` and `cpeApplicability` keys; paste those two keys into the record. Do not re-derive the same structures by hand.
+- If the script can't represent the case (extraction across apps, hex packages, gleam, fully manual ranges), fall back to the bullets below and explain why in the PR.
+
+### Other key things to get right
+
 - `cveMetadata`: only `assignerOrgId`, `assignerShortName`, `cveId`, `state: "PUBLISHED"` — no date fields
 - Two affected entries: package registry purl first, `pkg:github/...` second (see CLAUDE.md for type-specific rules). Edge case: the hex package manager itself uses `pkg:otp/hex?repository_url=...&vcs_url=...` (not `pkg:hex/hex` — hex cannot list itself in its own registry), but `versionType` stays `"semver"` because hex follows real semver.
 - `programRoutines`: always use Erlang notation `module:function/arity`. Elixir modules get the `'Elixir.ModuleName'` atom prefix — e.g. `'Elixir.Decimal':add/2`, `'Elixir.Hexpm.Store.Local':get/3`. Pure Erlang modules are lowercase — e.g. `ssh_sftpd:handle_op/4`.

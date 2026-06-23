@@ -1,0 +1,145 @@
+#!/usr/bin/env elixir
+#
+# otp-versions - query erlang/otp's otp_versions.table.
+#
+# The table maps every OTP release (e.g. OTP-28.3.2) to the exact app versions
+# (erts-16.2.1, ssh-5.4.1, ...) shipped in it. Both sides of the `#` separator
+# in each row are apps in that release; `#` only marks "updated in this release"
+# vs "carried over". This script fetches the master copy on every run.
+#
+# Usage:
+#   scripts/otp-versions app <app-name> <app-version>
+#       Print every OTP release that shipped <app-name> at exactly <app-version>,
+#       one per line, in the order the table lists them (newest first).
+#
+#   scripts/otp-versions release <OTP-release> <app-name>
+#       Print the version of <app-name> shipped in <OTP-release>. The release
+#       argument may be given with or without the OTP- prefix (28.3.2 or
+#       OTP-28.3.2 both work). Exits 1 if either is not found.
+#
+#   scripts/otp-versions list-releases
+#       Print every OTP release in the table, one per line, newest first.
+#
+#   scripts/otp-versions list-apps <OTP-release>
+#       Print every app shipped in <OTP-release> as "<name> <version>" lines.
+
+defmodule OtpVersions do
+  @table_url "https://raw.githubusercontent.com/erlang/otp/master/otp_versions.table"
+
+  defp halt_fail(m), do: (IO.puts(:stderr, m); System.halt(1))
+
+  # Fetch the table fresh each run via :httpc (stdlib, no extra deps).
+  defp fetch_table do
+    {:ok, _} = Application.ensure_all_started(:inets)
+    {:ok, _} = Application.ensure_all_started(:ssl)
+
+    request = {String.to_charlist(@table_url), []}
+
+    case :httpc.request(:get, request, [], body_format: :binary) do
+      {:ok, {{_, 200, _}, _headers, body}} ->
+        body
+
+      {:ok, {{_, status, reason}, _headers, _body}} ->
+        halt_fail("error: GET #{@table_url} -> #{status} #{reason}")
+
+      {:error, reason} ->
+        halt_fail("error: could not fetch #{@table_url}: #{inspect(reason)}")
+    end
+  end
+
+  # Parse a row like
+  #   OTP-28.3.2 : crypto-5.8.1 erts-16.2.1 # asn1-5.4.2 ... :
+  # into {"OTP-28.3.2", [{"crypto", "5.8.1"}, {"erts", "16.2.1"}, {"asn1", "5.4.2"}, ...]}.
+  # The `#` and trailing `:` are structural separators with no semantic difference
+  # for our lookups (both sides of `#` ship in the release).
+  defp parse_row(line) do
+    [release | rest] = String.split(line, ~r/\s+/, trim: true)
+    apps = rest |> Enum.reject(&(&1 in [":", "#"])) |> Enum.map(&split_app/1)
+    {release, apps}
+  end
+
+  # Split "foo-bar-1.2.3" -> {"foo-bar", "1.2.3"} (right-most "-" is the separator).
+  defp split_app(token) do
+    case String.split(token, "-") |> Enum.reverse() do
+      [version | name_parts] -> {name_parts |> Enum.reverse() |> Enum.join("-"), version}
+      _ -> halt_fail("error: malformed app token: #{token}")
+    end
+  end
+
+  defp rows do
+    fetch_table()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&parse_row/1)
+  end
+
+  defp normalize_release("OTP-" <> _ = r), do: r
+  defp normalize_release(r), do: "OTP-" <> r
+
+  defp usage do
+    IO.puts(:stderr, """
+    usage:
+      otp-versions app <app-name> <app-version>
+      otp-versions release <OTP-release> <app-name>
+      otp-versions list-releases
+      otp-versions list-apps <OTP-release>
+    """)
+
+    System.halt(1)
+  end
+
+  def main(["app", app, version]) do
+    rows()
+    |> Enum.filter(fn {_release, apps} -> {app, version} in apps end)
+    |> Enum.map_join("", fn {release, _} -> release <> "\n" end)
+    |> write_out()
+  end
+
+  def main(["release", release, app]) do
+    target = normalize_release(release)
+
+    case Enum.find(rows(), fn {r, _} -> r == target end) do
+      nil ->
+        halt_fail("error: #{target} not found in otp_versions.table")
+
+      {_, apps} ->
+        case List.keyfind(apps, app, 0) do
+          {_, version} -> IO.puts(version)
+          nil -> halt_fail("error: #{app} not shipped in #{target}")
+        end
+    end
+  end
+
+  def main(["list-releases"]) do
+    rows()
+    |> Enum.map_join("", fn {release, _} -> release <> "\n" end)
+    |> write_out()
+  end
+
+  def main(["list-apps", release]) do
+    target = normalize_release(release)
+
+    case Enum.find(rows(), fn {r, _} -> r == target end) do
+      nil ->
+        halt_fail("error: #{target} not found in otp_versions.table")
+
+      {_, apps} ->
+        apps
+        |> Enum.map_join("", fn {name, version} -> "#{name} #{version}\n" end)
+        |> write_out()
+    end
+  end
+
+  def main(_), do: usage()
+
+  # IO.write into a closed pipe (head, less, ...) raises :terminated; treat that
+  # as a clean exit so consumers can pipe freely.
+  defp write_out(buf) do
+    try do
+      IO.write(buf)
+    rescue
+      ErlangError -> System.halt(0)
+    end
+  end
+end
+
+OtpVersions.main(System.argv())

@@ -1,0 +1,601 @@
+#!/usr/bin/env elixir
+#
+# gen-affected - generate the `affected` and `cpeApplicability` JSON blocks
+# for a CVE record from an intro commit, optional fix commits, and source paths.
+#
+# Supported platforms: `erlang`, `elixir`. The subcommand selects the platform.
+# `gleam` and `hex` will be added later.
+#
+# Usage:
+#   scripts/gen-affected <platform> \
+#       --intro <SHA> \
+#       [--fix <SHA>]... \
+#       --path <repo-relative-path> [--path ...] \
+#       [--module <name>]... \
+#       [--routine <module:fun/arity>]...
+#
+# Output: {"affected": [...], "cpeApplicability": [...]} on stdout. Caller
+# merges into the record manually (cve-formatter will pretty-format on save).
+
+defmodule GenAffected do
+  @scripts_dir __DIR__
+
+  defp halt_fail(m), do: (IO.puts(:stderr, m); System.halt(1))
+  defp script(name), do: Path.join(@scripts_dir, name)
+
+  # ---- platform config -------------------------------------------------------
+  # Each platform pins the repo, CPE, tag conventions, and the small set of
+  # platform-specific helpers (path -> app, app version resolver, ...). The
+  # rest of the pipeline is shared.
+  defp config(:erlang) do
+    %{
+      repo: "https://github.com/erlang/otp.git",
+      repo_url: "https://github.com/erlang/otp",
+      package_repo_url: "https:%2F%2Fgithub.com%2Ferlang%2Fotp",
+      package_vcs_url: "git%20https:%2F%2Fgithub.com%2Ferlang%2Fotp.git",
+      cpe: "cpe:2.3:a:erlang:erlang\\/otp:*:*:*:*:*:*:*:*",
+      vendor: "Erlang",
+      product: "OTP",
+      github_package_name: "erlang/otp",
+      github_package_url: "pkg:github/erlang/otp",
+      version_type: "otp",
+      tag_prefixes: [{"OTP-", :modern}, {"OTP_R", :legacy}],
+      group_key: &otp_major/1,
+      group_label: fn k -> "#{k}.0" end,
+      todo_no_fixes: :latest_3_majors,
+      app_version_resolver: :otp_versions_table,
+      path_to_app: &erlang_path_to_app/1,
+      path_strip: &erlang_path_strip/1,
+      legacy_intro?: &erlang_legacy_intro?/1
+    }
+  end
+
+  defp config(:elixir) do
+    %{
+      repo: "https://github.com/elixir-lang/elixir.git",
+      repo_url: "https://github.com/elixir-lang/elixir",
+      package_repo_url: "https:%2F%2Fgithub.com%2Felixir-lang%2Felixir",
+      package_vcs_url: "git%20https:%2F%2Fgithub.com%2Felixir-lang%2Felixir.git",
+      cpe: "cpe:2.3:a:elixir-lang:elixir:*:*:*:*:*:*:*:*",
+      vendor: "elixir-lang",
+      product: "elixir",
+      github_package_name: "elixir-lang/elixir",
+      github_package_url: "pkg:github/elixir-lang/elixir",
+      version_type: "semver",
+      tag_prefixes: [{"v", :modern}],
+      # Elixir releases are versioned per minor; backports go to minor lines.
+      group_key: &elixir_minor/1,
+      group_label: fn {maj, min} -> "#{maj}.#{min}.0" end,
+      todo_no_fixes: :single_todo,
+      app_version_resolver: :identity,
+      path_to_app: &elixir_path_to_app/1,
+      path_strip: &elixir_path_strip/1,
+      legacy_intro?: fn _ -> false end
+    }
+  end
+
+  # ---- tag parsing -----------------------------------------------------------
+  defp tags_containing(cfg, sha) do
+    case System.cmd(script("refs-containing"), [cfg.repo, sha], stderr_to_stdout: true) do
+      {out, 0} ->
+        out
+        |> String.split("\n", trim: true)
+        |> Enum.flat_map(fn line ->
+          case String.split(line, ":", parts: 2) do
+            ["tag", name] -> classify_tag(cfg, name)
+            _ -> []
+          end
+        end)
+
+      {out, _} ->
+        IO.write(:stderr, out)
+        halt_fail("error: refs-containing failed for #{sha}")
+    end
+  end
+
+  defp classify_tag(cfg, name) do
+    Enum.find_value(cfg.tag_prefixes, [], fn {prefix, kind} ->
+      if String.starts_with?(name, prefix) do
+        [{kind, name, String.replace_prefix(name, prefix, "")}]
+      end
+    end)
+  end
+
+  # Earliest release tag containing the SHA. Legacy tags (OTP_R...) come from
+  # an era before semver and are chronologically earliest by definition, so we
+  # pick them whenever they're present. Among modern tags we prefer real
+  # releases over pre-releases (so a SHA in both v1.20.0-rc.2 and v1.20.1 is
+  # reported as v1.20.1, matching the public release).
+  defp earliest_tag(cfg, sha) do
+    tags = tags_containing(cfg, sha)
+    if tags == [], do: halt_fail("error: no release tag in #{cfg.repo} contains #{sha}")
+
+    legacy = Enum.filter(tags, fn {kind, _, _} -> kind == :legacy end)
+    modern = Enum.filter(tags, fn {kind, _, _} -> kind == :modern end)
+    modern_release = Enum.filter(modern, fn {_, _, v} -> not pre_release?(v) end)
+
+    cond do
+      legacy != [] ->
+        {_, name, _} = Enum.min_by(legacy, fn {_, _, v} -> v end)
+        name
+
+      modern_release != [] ->
+        {_, name, _} = Enum.min_by(modern_release, fn {_, _, v} -> parse_version(v) end)
+        name
+
+      true ->
+        {_, name, _} = Enum.min_by(modern, fn {_, _, v} -> parse_version(v) end)
+        name
+    end
+  end
+
+  defp pre_release?(version), do: String.contains?(version, "-")
+
+  # Strip the platform-specific prefix from a tag to yield the bare version.
+  defp strip_prefix(cfg, tag) do
+    Enum.find_value(cfg.tag_prefixes, tag, fn {prefix, kind} ->
+      if String.starts_with?(tag, prefix) do
+        bare = String.replace_prefix(tag, prefix, "")
+        # Legacy OTP tags use "OTP_R<series>" -> render as "R<series>".
+        if kind == :legacy, do: "R" <> bare, else: bare
+      end
+    end)
+  end
+
+  defp parse_version(tag) do
+    {numeric, suffix} =
+      case String.split(tag, "-", parts: 2) do
+        [n] -> {n, ""}
+        [n, s] -> {n, s}
+      end
+
+    nums =
+      numeric
+      |> String.split(".")
+      |> Enum.map(fn p ->
+        case Integer.parse(p) do
+          {i, ""} -> i
+          _ -> 0
+        end
+      end)
+
+    suffix_rank = if suffix == "", do: 1, else: 0
+    {nums, suffix_rank, suffix}
+  end
+
+  # ---- platform: erlang ------------------------------------------------------
+  defp otp_major("OTP-" <> rest), do: rest |> parse_version() |> elem(0) |> List.first()
+  defp otp_major("OTP_R" <> _), do: nil
+
+  defp erlang_path_to_app("erts/" <> _), do: "erts"
+  defp erlang_path_to_app("lib/" <> rest), do: rest |> String.split("/", parts: 2) |> List.first()
+  defp erlang_path_to_app(path), do: halt_fail("error: cannot map path #{path} to an OTP app (expected erts/... or lib/<app>/...)")
+
+  defp erlang_path_strip("erts/" <> rest), do: rest
+  defp erlang_path_strip("lib/" <> rest) do
+    case String.split(rest, "/", parts: 2) do
+      [_app, tail] -> tail
+      _ -> rest
+    end
+  end
+
+  defp erlang_legacy_intro?("OTP_R" <> _), do: true
+  defp erlang_legacy_intro?(_), do: false
+
+  # ---- platform: elixir ------------------------------------------------------
+  defp elixir_minor("v" <> rest) do
+    case parse_version(rest) |> elem(0) do
+      [maj, min | _] -> {maj, min}
+      [maj] -> {maj, 0}
+      _ -> nil
+    end
+  end
+  defp elixir_minor(_), do: nil
+
+  defp elixir_path_to_app("lib/" <> rest), do: rest |> String.split("/", parts: 2) |> List.first()
+  defp elixir_path_to_app(path), do: halt_fail("error: cannot map path #{path} to an Elixir sub-app (expected lib/<app>/...)")
+
+  defp elixir_path_strip("lib/" <> rest) do
+    case String.split(rest, "/", parts: 2) do
+      [_app, tail] -> tail
+      _ -> rest
+    end
+  end
+
+  # ---- app version resolver (otp_versions.table for Erlang, identity for Elixir)
+  # Returns the app's version in a given release tag.
+  defp app_version(:otp_versions_table, tag, app) do
+    case System.cmd(script("otp-versions"), ["release", tag, app], stderr_to_stdout: true) do
+      {out, 0} -> {:ok, String.trim(out)}
+      _ -> :error
+    end
+  end
+
+  defp app_version(:identity, tag, _app) do
+    # Elixir sub-apps share the elixir release version; strip the "v" prefix.
+    {:ok, String.replace_prefix(tag, "v", "")}
+  end
+
+  defp app_version!(cfg, tag, app) do
+    case app_version(cfg.app_version_resolver, tag, app) do
+      {:ok, v} -> v
+      :error -> halt_fail("error: cannot resolve #{app}'s version in #{tag}")
+    end
+  end
+
+  # The app's introducing version. If the app shipped in intro_tag, that's it.
+  # Otherwise (Erlang extraction case, e.g. tftp split out of inets) walk
+  # forward through releases until the app first appears.
+  defp first_release_shipping_app(cfg, intro_tag, app) do
+    case app_version(cfg.app_version_resolver, intro_tag, app) do
+      {:ok, v} ->
+        {v, intro_tag}
+
+      :error ->
+        # Only meaningful for the otp_versions.table resolver.
+        all = list_releases(cfg)
+        intro_v = parse_version(strip_prefix(cfg, intro_tag))
+
+        forward =
+          all
+          |> Enum.filter(fn r -> parse_version(strip_prefix(cfg, r)) >= intro_v end)
+          |> Enum.reverse()
+
+        case Enum.find_value(forward, fn r ->
+               case app_version(cfg.app_version_resolver, r, app) do
+                 {:ok, v} -> {v, r}
+                 :error -> nil
+               end
+             end) do
+          {v, r} -> {v, r}
+          nil -> halt_fail("error: no release at or after #{intro_tag} ships #{app}")
+        end
+    end
+  end
+
+  defp list_releases(%{app_version_resolver: :otp_versions_table}) do
+    case System.cmd(script("otp-versions"), ["list-releases"], stderr_to_stdout: true) do
+      {out, 0} -> String.split(out, "\n", trim: true)
+      _ -> halt_fail("error: otp-versions list-releases failed")
+    end
+  end
+
+  defp list_releases(_), do: []
+
+  # ---- per-major resolution --------------------------------------------------
+  defp resolve_fixes(cfg, fixes) do
+    fixes
+    |> Enum.map(fn sha -> {sha, earliest_tag(cfg, sha)} end)
+    |> Enum.group_by(fn {_, tag} -> cfg.group_key.(tag) end)
+    |> Map.new(fn {key, pairs} ->
+      {sha, tag} =
+        Enum.min_by(pairs, fn {_, t} -> parse_version(strip_prefix(cfg, t)) end)
+
+      {key, {tag, sha}}
+    end)
+  end
+
+  defp per_major_entries(cfg, fixes, intro_tag) do
+    if fixes == [] do
+      case cfg.todo_no_fixes do
+        :latest_3_majors ->
+          intro_key = cfg.group_key.(intro_tag)
+
+          # For Erlang, group_key returns the major int. Filter to majors >= intro_major.
+          case System.cmd(script("otp-versions"), ["list-releases"], stderr_to_stdout: true) do
+            {out, 0} ->
+              out
+              |> String.split("\n", trim: true)
+              |> Enum.map(&cfg.group_key.(&1))
+              |> Enum.uniq()
+              |> Enum.filter(fn k -> intro_key == nil or k >= intro_key end)
+              |> Enum.take(3)
+              |> Enum.map(fn k ->
+                %{key: k, fix_tag: "TODO#{k}", fix_sha: "TODO#{k}", todo: true}
+              end)
+
+            _ ->
+              halt_fail("error: otp-versions list-releases failed")
+          end
+
+        :single_todo ->
+          # Elixir: a single TODO slot keyed by intro's minor (we can't predict
+          # which minor will receive the fix).
+          intro_key = cfg.group_key.(intro_tag)
+          label = "TODO"
+
+          [%{key: intro_key, fix_tag: label, fix_sha: label, todo: true}]
+      end
+    else
+      resolve_fixes(cfg, fixes)
+      |> Enum.sort_by(fn {k, _} -> sort_neg(k) end)
+      |> Enum.map(fn {key, {fix_tag, fix_sha}} ->
+        %{key: key, fix_tag: fix_tag, fix_sha: fix_sha, todo: false}
+      end)
+    end
+  end
+
+  # Sort key for descending major/minor ordering. Handles both integer
+  # (Erlang major) and {major, minor} tuple (Elixir).
+  defp sort_neg(n) when is_integer(n), do: -n
+  defp sort_neg({a, b}), do: {-a, -b}
+  defp sort_neg(_), do: 0
+
+  # ---- entry builders --------------------------------------------------------
+  defp build_github_entry(cfg, intro_sha, intro_tag, per_major, paths, modules, routines) do
+    intro_version = strip_prefix(cfg, intro_tag)
+
+    otp_version =
+      case per_major do
+        [%{fix_tag: tag, todo: todo}] ->
+          %{
+            "lessThan" => if(todo, do: tag, else: strip_prefix(cfg, tag)),
+            "status" => "affected",
+            "version" => intro_version,
+            "versionType" => cfg.version_type
+          }
+
+        _ ->
+          %{
+            "changes" => Enum.map(per_major, fn m ->
+              %{"at" => if(m.todo, do: m.fix_tag, else: strip_prefix(cfg, m.fix_tag)),
+                "status" => "unaffected"}
+            end),
+            "lessThan" => "*",
+            "status" => "affected",
+            "version" => intro_version,
+            "versionType" => cfg.version_type
+          }
+      end
+
+    git_version =
+      case per_major do
+        [%{fix_sha: sha}] ->
+          %{
+            "lessThan" => sha,
+            "status" => "affected",
+            "version" => intro_sha,
+            "versionType" => "git"
+          }
+
+        _ ->
+          %{
+            "changes" => Enum.map(per_major, fn m -> %{"at" => m.fix_sha, "status" => "unaffected"} end),
+            "lessThan" => "*",
+            "status" => "affected",
+            "version" => intro_sha,
+            "versionType" => "git"
+          }
+      end
+
+    base_entry(paths, modules, routines)
+    |> Map.merge(%{
+      "collectionURL" => "https://github.com",
+      "cpes" => [cfg.cpe],
+      "packageName" => cfg.github_package_name,
+      "packageURL" => cfg.github_package_url,
+      "product" => cfg.product,
+      "repo" => cfg.repo_url,
+      "vendor" => cfg.vendor,
+      "versions" => [otp_version, git_version]
+    })
+  end
+
+  defp build_app_entry(cfg, app, intro_tag, per_major, paths, modules, routines) do
+    {intro_app_version, _} = first_release_shipping_app(cfg, intro_tag, app)
+
+    versions =
+      case per_major do
+        [%{todo: true, key: k}] ->
+          [%{"lessThan" => "TODO#{format_key(k)}",
+             "status" => "affected", "version" => intro_app_version,
+             "versionType" => cfg.version_type}]
+
+        [%{todo: false, fix_tag: tag}] ->
+          [%{"lessThan" => app_version!(cfg, tag, app),
+             "status" => "affected", "version" => intro_app_version,
+             "versionType" => cfg.version_type}]
+
+        _ ->
+          changes =
+            Enum.flat_map(per_major, fn m ->
+              if m.todo do
+                [%{"at" => "TODO#{format_key(m.key)}", "status" => "unaffected"}]
+              else
+                [%{"at" => app_version!(cfg, m.fix_tag, app), "status" => "unaffected"}]
+              end
+            end)
+
+          [%{"changes" => changes, "lessThan" => "*",
+             "status" => "affected", "version" => intro_app_version,
+             "versionType" => cfg.version_type}]
+      end
+
+    relative_paths = Enum.map(paths, cfg.path_strip)
+
+    base_entry(relative_paths, modules, routines)
+    |> Map.merge(%{
+      "cpes" => [cfg.cpe],
+      "packageName" => app,
+      "packageURL" => "pkg:otp/#{app}?repository_url=#{cfg.package_repo_url}&vcs_url=#{cfg.package_vcs_url}",
+      "product" => cfg.product,
+      "repo" => cfg.repo_url,
+      "vendor" => cfg.vendor,
+      "versions" => versions
+    })
+  end
+
+  defp format_key(k) when is_integer(k), do: "#{k}"
+  defp format_key({maj, min}), do: "#{maj}.#{min}"
+  defp format_key(_), do: ""
+
+  defp base_entry(paths, modules, routines) do
+    entry = %{
+      "defaultStatus" => "unaffected",
+      "programFiles" => paths
+    }
+
+    entry = if modules == [], do: entry, else: Map.put(entry, "modules", modules)
+
+    if routines == [],
+      do: entry,
+      else: Map.put(entry, "programRoutines", Enum.map(routines, &%{"name" => &1}))
+  end
+
+  defp build_cpe_applicability(cfg, intro_tag, per_major) do
+    drop_lower_on_lowest? = cfg.legacy_intro?.(intro_tag)
+    intro_version = strip_prefix(cfg, intro_tag)
+
+    # Chain the cpeMatches so they cover the intro->highest-fix range without
+    # overlap or gaps:
+    #   match 1: intro_version           -> fix 1
+    #   match 2: (fix 1 minor + 1).0     -> fix 2
+    #   match 3: (fix 2 minor + 1).0     -> fix 3
+    #   ...
+    # Sort ascending by group_key (oldest fix first), so each match's lower
+    # bound is "where the previous fix's range ended".
+    sorted = per_major |> Enum.sort_by(&sort_neg(&1.key)) |> Enum.reverse()
+    lowest = List.first(sorted)
+
+    {matches, _} =
+      Enum.map_reduce(sorted, nil, fn m, prev ->
+        match = %{"criteria" => cfg.cpe, "vulnerable" => true}
+
+        end_excl = if m.todo, do: "TODO#{format_key(m.key)}", else: strip_prefix(cfg, m.fix_tag)
+        match = Map.put(match, "versionEndExcluding", end_excl)
+
+        match =
+          cond do
+            drop_lower_on_lowest? and m == lowest ->
+              match
+
+            prev == nil ->
+              Map.put(match, "versionStartIncluding", intro_version)
+
+            true ->
+              Map.put(match, "versionStartIncluding", cfg.group_label.(next_key(prev.key)))
+          end
+
+        {match, m}
+      end)
+
+    %{
+      "nodes" => [%{"cpeMatch" => matches, "negate" => false, "operator" => "OR"}],
+      "operator" => "AND"
+    }
+  end
+
+  # Successor for group_key: integer -> +1, {maj, min} -> {maj, min+1}.
+  defp next_key(k) when is_integer(k), do: k + 1
+  defp next_key({maj, min}), do: {maj, min + 1}
+
+  # ---- pipeline --------------------------------------------------------------
+  defp run(cfg, opts) do
+    intro = opts.intro || halt_fail("error: --intro <SHA> is required")
+    paths = if opts.paths == [], do: halt_fail("error: at least one --path is required"), else: opts.paths
+    fixes = opts.fixes
+    modules = opts.modules
+    routines = opts.routines
+
+    paths_by_app = Enum.group_by(paths, cfg.path_to_app)
+    apps = Map.keys(paths_by_app) |> Enum.sort()
+
+    intro_tag = earliest_tag(cfg, intro)
+    per_major = per_major_entries(cfg, fixes, intro_tag)
+
+    github_entry = build_github_entry(cfg, intro, intro_tag, per_major, paths, modules, routines)
+
+    app_entries =
+      Enum.map(apps, fn app ->
+        build_app_entry(cfg, app, intro_tag, per_major, paths_by_app[app], modules, routines)
+      end)
+
+    %{
+      "affected" => app_entries ++ [github_entry],
+      "cpeApplicability" => [build_cpe_applicability(cfg, intro_tag, per_major)]
+    }
+  end
+
+  # ---- arg parsing -----------------------------------------------------------
+  defp parse_args(argv) do
+    {opts, rest, invalid} =
+      OptionParser.parse(argv,
+        strict: [
+          intro: :string,
+          fix: :keep,
+          path: :keep,
+          module: :keep,
+          routine: :keep,
+          help: :boolean
+        ],
+        aliases: [h: :help]
+      )
+
+    unless invalid == [], do: halt_fail("error: unknown option: #{inspect(invalid)}")
+    if Keyword.get(opts, :help), do: (usage(); System.halt(0))
+
+    %{
+      intro: Keyword.get(opts, :intro),
+      fixes: Keyword.get_values(opts, :fix),
+      paths: Keyword.get_values(opts, :path),
+      modules: Keyword.get_values(opts, :module),
+      routines: Keyword.get_values(opts, :routine),
+      rest: rest
+    }
+  end
+
+  defp usage do
+    IO.puts(:stderr, """
+    usage:
+      gen-affected <erlang|elixir> --intro <SHA> [--fix <SHA>]...
+                                   --path <path> [--path ...]
+                                   [--module <name>]... [--routine <module:fun/arity>]...
+    """)
+  end
+
+  def main(["erlang" | rest]), do: dispatch(:erlang, rest)
+  def main(["elixir" | rest]), do: dispatch(:elixir, rest)
+  def main(["--help"]), do: (usage(); System.halt(0))
+  def main(["-h"]), do: (usage(); System.halt(0))
+  def main([]), do: (usage(); System.halt(1))
+  def main([cmd | _]), do: halt_fail("error: unknown subcommand #{inspect(cmd)} (supported: erlang, elixir)")
+
+  defp dispatch(platform, args) do
+    opts = parse_args(args)
+    result = run(config(platform), opts)
+    IO.puts(format_json(result))
+  end
+
+  defp format_json(term), do: pretty(term, 0)
+
+  defp pretty(map, indent) when is_map(map) do
+    keys = Map.keys(map) |> Enum.sort()
+    inner = indent + 2
+    pad = String.duplicate(" ", inner)
+    close_pad = String.duplicate(" ", indent)
+
+    body =
+      keys
+      |> Enum.map(fn k -> "#{pad}#{JSON.encode!(k)}: #{pretty(map[k], inner)}" end)
+      |> Enum.join(",\n")
+
+    if body == "", do: "{}", else: "{\n#{body}\n#{close_pad}}"
+  end
+
+  defp pretty(list, indent) when is_list(list) do
+    inner = indent + 2
+    pad = String.duplicate(" ", inner)
+    close_pad = String.duplicate(" ", indent)
+
+    body =
+      list
+      |> Enum.map(fn v -> "#{pad}#{pretty(v, inner)}" end)
+      |> Enum.join(",\n")
+
+    if body == "", do: "[]", else: "[\n#{body}\n#{close_pad}]"
+  end
+
+  defp pretty(other, _indent), do: JSON.encode!(other)
+end
+
+GenAffected.main(System.argv())

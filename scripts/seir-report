@@ -1,0 +1,295 @@
+#!/usr/bin/env elixir
+
+# SEIR two-week check-in metrics.
+#
+# Usage:
+#   scripts/seir-report <from-date> <to-date>
+#
+# Dates are inclusive, ISO 8601 (YYYY-MM-DD), interpreted as UTC day boundaries:
+# from = from-date 00:00:00Z, to = to-date 23:59:59Z.
+#
+# Counts:
+#   * Projects actively supported  -> unique `repo` values across all matching CVEs.
+#   * Security findings            -> total count of matching CVEs (not deduped).
+#
+# A CVE matches if either:
+#   * Its record file in records/<year>/ has `cveMetadata.datePublished` in range, or
+#   * It appears as a `records/<year>/CVE-*.json` file in a PR (any state) where at
+#     least one commit in that PR has an authored or committed date in range.
+
+defmodule SeirReport do
+  @records_base_path Path.expand("../records", __DIR__)
+
+  def run([from_arg, to_arg]) do
+    from = parse_date_start(from_arg)
+    to = parse_date_end(to_arg)
+
+    IO.puts(:stderr, "Range: #{DateTime.to_iso8601(from)} .. #{DateTime.to_iso8601(to)}")
+
+    published = published_cves(from, to)
+    IO.puts(:stderr, "Published CVE records in range: #{length(published)}")
+
+    {pr_cves, manual_prs} = pr_cves(from, to)
+    IO.puts(:stderr, "PR-touched CVE references in range: #{length(pr_cves)}")
+    IO.puts(:stderr, "PRs needing manual review: #{length(manual_prs)}")
+
+    findings =
+      (published ++ pr_cves)
+      |> Enum.group_by(& &1.cve_id)
+      |> Enum.map(fn {cve_id, group} ->
+        repos = group |> Enum.flat_map(& &1.repos) |> Enum.uniq() |> Enum.sort()
+        sources = group |> Enum.map(& &1.source) |> Enum.uniq()
+        %{cve_id: cve_id, repos: repos, sources: sources}
+      end)
+
+    repos = findings |> Enum.flat_map(& &1.repos) |> Enum.uniq() |> Enum.sort()
+
+    IO.puts("")
+    IO.puts("Findings (unique CVE IDs): #{length(findings)}")
+    IO.puts("Projects (unique repos):   #{length(repos)}")
+    IO.puts("")
+    IO.puts("Repos:")
+    Enum.each(repos, &IO.puts("  #{&1}"))
+
+    IO.puts("")
+    IO.puts("Findings detail:")
+
+    findings
+    |> Enum.sort_by(& &1.cve_id)
+    |> Enum.each(fn f ->
+      tags =
+        f.sources
+        |> Enum.map(fn
+          {:published, _} -> "published"
+          {:pr, n} -> "PR ##{n}"
+        end)
+        |> Enum.uniq()
+        |> Enum.join(", ")
+
+      repos_str =
+        case f.repos do
+          [] -> "(no repo extracted - check PRs by hand)"
+          rs -> Enum.join(rs, ", ")
+        end
+
+      IO.puts("  #{f.cve_id}  [#{tags}]  #{repos_str}")
+    end)
+
+    if manual_prs != [] do
+      IO.puts("")
+      IO.puts("PRs in range with no valid CVE record - check by hand:")
+
+      manual_prs
+      |> Enum.sort_by(& &1.number)
+      |> Enum.each(fn pr ->
+        IO.puts("  PR ##{pr.number}  #{pr.state}  #{pr.title}")
+      end)
+    end
+  end
+
+  def run(_) do
+    IO.puts(:stderr, "Usage: seir-report <from-date YYYY-MM-DD> <to-date YYYY-MM-DD>")
+    System.halt(2)
+  end
+
+  defp parse_date_start(s) do
+    {:ok, d} = Date.from_iso8601(s)
+    {:ok, dt} = DateTime.new(d, ~T[00:00:00], "Etc/UTC")
+    dt
+  end
+
+  defp parse_date_end(s) do
+    {:ok, d} = Date.from_iso8601(s)
+    {:ok, dt} = DateTime.new(d, ~T[23:59:59], "Etc/UTC")
+    dt
+  end
+
+  defp published_cves(from, to) do
+    @records_base_path
+    |> Path.join("*/CVE-*.json")
+    |> Path.wildcard()
+    |> Enum.flat_map(fn path ->
+      with {:ok, content} <- File.read(path),
+           {:ok, json} <- JSON.decode(content),
+           %{"cveMetadata" => %{"datePublished" => published}} <- json,
+           {:ok, published_dt, _} <- DateTime.from_iso8601(published),
+           true <- in_range?(published_dt, from, to) do
+        [%{
+          cve_id: cve_id_from_path(path),
+          repos: extract_repos(json),
+          source: {:published, published}
+        }]
+      else
+        _ -> []
+      end
+    end)
+  end
+
+  defp pr_cves(from, to) do
+    results =
+      pr_numbers()
+      |> Task.async_stream(&pr_finding(&1, from, to), max_concurrency: 8, timeout: 60_000)
+      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.reject(&is_nil/1)
+
+    findings = Enum.flat_map(results, & &1.findings)
+    manual = results |> Enum.filter(& &1.needs_manual_review) |> Enum.map(& &1.pr_info)
+
+    {findings, manual}
+  end
+
+  defp pr_numbers do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "list",
+        "--repo", repo(),
+        "--state", "all",
+        "--json", "number",
+        "--limit", "500"
+      ])
+
+    output |> JSON.decode!() |> Enum.map(& &1["number"])
+  end
+
+  defp pr_finding(pr_number, from, to) do
+    pr = pr_view(pr_number)
+
+    created_in_range? =
+      case DateTime.from_iso8601(pr["createdAt"] || "") do
+        {:ok, dt, _} -> in_range?(dt, from, to)
+        _ -> false
+      end
+
+    commit_in_range? =
+      (pr["commits"] || [])
+      |> Enum.any?(fn c ->
+        [c["authoredDate"], c["committedDate"]]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.any?(fn iso ->
+          case DateTime.from_iso8601(iso) do
+            {:ok, dt, _} -> in_range?(dt, from, to)
+            _ -> false
+          end
+        end)
+      end)
+
+    if created_in_range? or commit_in_range? do
+      cve_files =
+        (pr["files"] || [])
+        |> Enum.map(& &1["path"])
+        |> Enum.filter(&Regex.match?(~r/^records\/\d{4}\/CVE-\d{4}-\d+\.json$/, &1))
+        |> Enum.map(&{cve_id_from_path(&1), &1})
+
+      head_ref = pr["headRefOid"]
+
+      findings =
+        Enum.map(cve_files, fn {cve_id, path} ->
+          repos = pr_record_repos(head_ref, path)
+          %{cve_id: cve_id, repos: repos, source: {:pr, pr_number}}
+        end)
+
+      needs_manual_review =
+        cve_files != [] and Enum.all?(findings, &(&1.repos == []))
+
+      pr_info = %{
+        number: pr_number,
+        title: pr["title"] || "",
+        state: pr["state"] || ""
+      }
+
+      %{findings: findings, needs_manual_review: needs_manual_review, pr_info: pr_info}
+    else
+      nil
+    end
+  end
+
+  defp pr_view(pr_number) do
+    {output, 0} =
+      System.cmd("gh", [
+        "pr", "view", Integer.to_string(pr_number),
+        "--repo", repo(),
+        "--json", "number,title,state,createdAt,commits,files,headRefOid"
+      ])
+
+    JSON.decode!(output)
+  end
+
+  # Read the CVE JSON as it exists in the PR head, falling back to the local
+  # file if the PR fetch fails (e.g. file deleted in PR).
+  defp pr_record_repos(head_ref, path) do
+    case fetch_pr_file(head_ref, path) do
+      {:ok, content} ->
+        case JSON.decode(content) do
+          {:ok, json} -> extract_repos(json)
+          _ -> []
+        end
+
+      :error ->
+        full_path = Path.expand("../#{path}", __DIR__)
+
+        case File.read(full_path) do
+          {:ok, content} ->
+            case JSON.decode(content) do
+              {:ok, json} -> extract_repos(json)
+              _ -> []
+            end
+
+          _ ->
+            []
+        end
+    end
+  end
+
+  defp fetch_pr_file(nil, _path), do: :error
+
+  defp fetch_pr_file(ref, path) do
+    case System.cmd("gh", [
+           "api",
+           "repos/#{repo()}/contents/#{path}?ref=#{ref}",
+           "-H", "Accept: application/vnd.github.raw"
+         ], stderr_to_stdout: true) do
+      {content, 0} -> {:ok, content}
+      _ -> :error
+    end
+  end
+
+  defp extract_repos(json) do
+    affected =
+      get_in(json, ["containers", "cna", "affected"]) ||
+        get_in(json, ["containers", "adp", "affected"]) ||
+        []
+
+    affected
+    |> Enum.map(& &1["repo"])
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&normalize_repo/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_repo(url) do
+    url
+    |> String.trim_trailing("/")
+    |> String.replace_suffix(".git", "")
+  end
+
+  defp in_range?(dt, from, to) do
+    DateTime.compare(dt, from) != :lt and DateTime.compare(dt, to) != :gt
+  end
+
+  defp cve_id_from_path(path), do: Path.basename(path, ".json")
+
+  defp repo do
+    case :persistent_term.get({__MODULE__, :repo}, nil) do
+      nil ->
+        {output, 0} = System.cmd("gh", ["repo", "view", "--json", "nameWithOwner"])
+        name = output |> JSON.decode!() |> Map.fetch!("nameWithOwner")
+        :persistent_term.put({__MODULE__, :repo}, name)
+        name
+
+      name ->
+        name
+    end
+  end
+end
+
+SeirReport.run(System.argv())

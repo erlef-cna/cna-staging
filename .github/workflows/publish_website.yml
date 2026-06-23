@@ -47,7 +47,7 @@ jobs:
             -path 'records/reservations' -prune \
           -or \
             -type f -name '*.json' \
-            -exec cp -f {} "website/${WEBSITE_CVE_DIR}/" \; && \
+            -exec sh -c 'jq -e ".cveMetadata.datePublished" "$1" >/dev/null 2>&1 && cp -f "$1" "$2/"' _ {} "website/${WEBSITE_CVE_DIR}" \; && \
           mkdir -p \
             "website/${WEBSITE_OSV_DIR}" && \
           find osv \
