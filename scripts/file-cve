@@ -650,12 +650,11 @@ defmodule FileCVE do
   defp print_original_report(""), do: info("advisory has no existing description to preserve")
 
   defp print_original_report(original) do
-    bar = String.duplicate("=", 85)
-    IO.puts("\n#{bar}")
-    IO.puts("# Original report")
-    IO.puts(bar <> "\n")
+    IO.puts("### Original report")
+    IO.puts("<details>")
+    IO.puts("<summary>Original report</summary>\n")
     IO.puts(original)
-    IO.puts("\n#{bar}\n")
+    IO.puts("\n</details>")
   end
 
   # Build the new advisory description: print the original (for the "Original
@@ -903,7 +902,7 @@ defmodule FileCVE do
       end
 
     title = pr_title(id, content, st)
-    body = pr_body(id, draft)
+    body = pr_body(content)
 
     # All branch/commit/push work happens in a dedicated worktree, so parallel
     # `pr` runs never switch the shared checkout's branch out from under each
@@ -1066,16 +1065,17 @@ defmodule FileCVE do
     info("0.5e working tree restored to clean main (record now lives in branch cve/#{id})")
   end
 
-  defp pr_body(id, draft) do
-    base = "Files #{id}."
-
-    if draft do
-      base <>
-        "\n\n> **Preview, not ready to merge.** Still contains TODO placeholders " <>
-        "(e.g. the unreleased fix version in `lessThan`, patch URL). " <>
-        "Re-run `scripts/file-cve pr #{id}` once filled to mark it ready."
-    else
-      base
+  # The PR description is just the advisory URL: the first vendor-advisory
+  # reference, falling back to the GHSA URL reconstructed from the record.
+  defp pr_body(content) do
+    (content |> JSON.decode!() |> get_in(["containers", "cna", "references"]) || [])
+    |> Enum.find_value(fn ref ->
+      url = to_string(ref["url"])
+      if "vendor-advisory" in (ref["tags"] || []) and url != "", do: url
+    end)
+    |> case do
+      url when is_binary(url) -> url
+      _ -> advisory_url_from_record(content)
     end
   end
 

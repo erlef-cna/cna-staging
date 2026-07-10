@@ -3,8 +3,8 @@
 # gen-affected - generate the `affected` and `cpeApplicability` JSON blocks
 # for a CVE record from an intro commit, optional fix commits, and source paths.
 #
-# Supported platforms: `erlang`, `elixir`. The subcommand selects the platform.
-# `gleam` and `hex` will be added later.
+# Supported platforms: `erlang`, `elixir`, `hex`. The subcommand selects the
+# platform. `gleam` will be added later.
 #
 # Usage:
 #   scripts/gen-affected <platform> \
@@ -17,6 +17,8 @@
 # Output: {"affected": [...], "cpeApplicability": [...]} on stdout. Caller
 # merges into the record manually (cve-formatter will pretty-format on save).
 
+Mix.install([{:purl, "~> 0.4"}])
+
 defmodule GenAffected do
   @scripts_dir __DIR__
 
@@ -27,42 +29,49 @@ defmodule GenAffected do
   # Each platform pins the repo, CPE, tag conventions, and the small set of
   # platform-specific helpers (path -> app, app version resolver, ...). The
   # rest of the pipeline is shared.
-  defp config(:erlang) do
+  defp config(:erlang, _opts) do
     %{
       repo: "https://github.com/erlang/otp.git",
       repo_url: "https://github.com/erlang/otp",
-      package_repo_url: "https:%2F%2Fgithub.com%2Ferlang%2Fotp",
-      package_vcs_url: "git%20https:%2F%2Fgithub.com%2Ferlang%2Fotp.git",
       cpe: "cpe:2.3:a:erlang:erlang\\/otp:*:*:*:*:*:*:*:*",
       vendor: "Erlang",
       product: "OTP",
       github_package_name: "erlang/otp",
-      github_package_url: "pkg:github/erlang/otp",
+      github_package_url: github_purl("erlang", "otp"),
       version_type: "otp",
+      github_versions: :otp_and_git,
       tag_prefixes: [{"OTP-", :modern}, {"OTP_R", :legacy}],
+      pre_releases_are_stable: false,
       group_key: &otp_major/1,
       group_label: fn k -> "#{k}.0" end,
       todo_no_fixes: :latest_3_majors,
       app_version_resolver: :otp_versions_table,
       path_to_app: &erlang_path_to_app/1,
       path_strip: &erlang_path_strip/1,
-      legacy_intro?: &erlang_legacy_intro?/1
+      legacy_intro?: &erlang_legacy_intro?/1,
+      build_entries: &default_build_entries/1,
+      app_entry_extras: fn app ->
+        %{
+          "packageName" => app,
+          "packageURL" => otp_app_purl(app, "https://github.com/erlang/otp")
+        }
+      end
     }
   end
 
-  defp config(:elixir) do
+  defp config(:elixir, _opts) do
     %{
       repo: "https://github.com/elixir-lang/elixir.git",
       repo_url: "https://github.com/elixir-lang/elixir",
-      package_repo_url: "https:%2F%2Fgithub.com%2Felixir-lang%2Felixir",
-      package_vcs_url: "git%20https:%2F%2Fgithub.com%2Felixir-lang%2Felixir.git",
       cpe: "cpe:2.3:a:elixir-lang:elixir:*:*:*:*:*:*:*:*",
       vendor: "elixir-lang",
       product: "elixir",
       github_package_name: "elixir-lang/elixir",
-      github_package_url: "pkg:github/elixir-lang/elixir",
+      github_package_url: github_purl("elixir-lang", "elixir"),
       version_type: "semver",
+      github_versions: :git_only,
       tag_prefixes: [{"v", :modern}],
+      pre_releases_are_stable: true,
       # Elixir releases are versioned per minor; backports go to minor lines.
       group_key: &elixir_minor/1,
       group_label: fn {maj, min} -> "#{maj}.#{min}.0" end,
@@ -70,8 +79,123 @@ defmodule GenAffected do
       app_version_resolver: :identity,
       path_to_app: &elixir_path_to_app/1,
       path_strip: &elixir_path_strip/1,
-      legacy_intro?: fn _ -> false end
+      legacy_intro?: fn _ -> false end,
+      build_entries: &default_build_entries/1,
+      app_entry_extras: fn app ->
+        %{
+          "packageName" => app,
+          "packageURL" => otp_app_purl(app, "https://github.com/elixir-lang/elixir")
+        }
+      end
     }
+  end
+
+  defp config(:hex, opts) do
+    package = opts.package || halt_fail("error: --package <name> is required for hex")
+    repo_url = opts.repo || halt_fail("error: --repo <github-url> is required for hex")
+    repo_url = String.replace_suffix(repo_url, ".git", "")
+    {owner, name} = parse_github_repo(repo_url)
+
+    %{
+      repo: repo_url <> ".git",
+      repo_url: repo_url,
+      cpe: "cpe:2.3:a:#{owner}:#{package}:*:*:*:*:*:*:*:*",
+      vendor: owner,
+      product: package,
+      github_package_name: "#{owner}/#{name}",
+      github_package_url: github_purl(owner, name),
+      version_type: "semver",
+      github_versions: :git_only,
+      # Accept both `vX.Y.Z` and `X.Y.Z` tags. The `v` prefix matches first; bare
+      # tags fall through and are validated as semver in classify_tag.
+      tag_prefixes: [{"v", :modern}, {"", :modern}],
+      pre_releases_are_stable: true,
+      # Hex packages are semver; group backports by minor like Elixir.
+      group_key: &hex_minor/1,
+      group_label: fn {maj, min} -> "#{maj}.#{min}.0" end,
+      todo_no_fixes: :single_todo,
+      app_version_resolver: :identity,
+      path_to_app: fn _ -> package end,
+      path_strip: fn p -> p end,
+      legacy_intro?: fn _ -> false end,
+      build_entries: &default_build_entries/1,
+      app_entry_extras: fn _app ->
+        %{
+          "collectionURL" => "https://repo.hex.pm",
+          "packageName" => package,
+          "packageURL" => hex_purl(package)
+        }
+      end
+    }
+  end
+
+  defp config(:gleam, _opts) do
+    %{
+      repo: "https://github.com/gleam-lang/gleam.git",
+      repo_url: "https://github.com/gleam-lang/gleam",
+      cpe: "cpe:2.3:a:gleam-lang:gleam:*:*:*:*:*:*:*:*",
+      vendor: "Gleam",
+      product: "Gleam",
+      github_package_name: "gleam-lang/gleam",
+      github_package_url: github_purl("gleam-lang", "gleam"),
+      version_type: "semver",
+      github_versions: :git_only,
+      tag_prefixes: [{"v", :modern}],
+      pre_releases_are_stable: true,
+      # Gleam follows semver per minor.
+      group_key: &elixir_minor/1,
+      group_label: fn {maj, min} -> "#{maj}.#{min}.0" end,
+      todo_no_fixes: :single_todo,
+      app_version_resolver: :identity,
+      path_to_app: fn _ -> "gleam" end,
+      path_strip: fn p -> p end,
+      legacy_intro?: fn _ -> false end,
+      build_entries: &gleam_build_entries/1,
+      app_entry_extras: fn _ -> %{} end
+    }
+  end
+
+  # ---- purl helpers ----------------------------------------------------------
+  defp github_purl(owner, name) do
+    Purl.to_string(struct!(Purl, type: "github", namespace: [owner], name: name))
+  end
+
+  defp hex_purl(name) do
+    Purl.to_string(struct!(Purl, type: "hex", name: name))
+  end
+
+  defp otp_app_purl(app, repo_url) do
+    Purl.to_string(
+      struct!(Purl,
+        type: "otp",
+        name: app,
+        qualifiers: %{
+          "repository_url" => repo_url,
+          "vcs_url" => "git #{repo_url}.git"
+        }
+      )
+    )
+  end
+
+  defp sid_gleam_purl do
+    Purl.to_string(struct!(Purl, type: "sid", namespace: ["gleam.run"], name: "gleam"))
+  end
+
+  defp oci_gleam_purl do
+    Purl.to_string(
+      struct!(Purl,
+        type: "oci",
+        name: "gleam",
+        qualifiers: %{"repository_url" => "ghcr.io/gleam-lang"}
+      )
+    )
+  end
+
+  defp parse_github_repo(url) do
+    case Regex.run(~r{github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?/?$}, url) do
+      [_, owner, name] -> {owner, name}
+      _ -> halt_fail("error: cannot parse GitHub owner/repo from #{url}")
+    end
   end
 
   # ---- tag parsing -----------------------------------------------------------
@@ -96,34 +220,50 @@ defmodule GenAffected do
   defp classify_tag(cfg, name) do
     Enum.find_value(cfg.tag_prefixes, [], fn {prefix, kind} ->
       if String.starts_with?(name, prefix) do
-        [{kind, name, String.replace_prefix(name, prefix, "")}]
+        bare = String.replace_prefix(name, prefix, "")
+        if version_like?(kind, bare), do: [{kind, name, bare}]
       end
     end)
   end
 
+  # A bare tag must start with a digit to count as a release version. Stops the
+  # hex platform's empty-prefix fallback from sweeping in non-version tags like
+  # "release-candidate" or "latest".
+  defp version_like?(:legacy, _), do: true
+  defp version_like?(:modern, <<c, _::binary>>) when c in ?0..?9, do: true
+  defp version_like?(_, _), do: false
+
   # Earliest release tag containing the SHA. Legacy tags (OTP_R...) come from
   # an era before semver and are chronologically earliest by definition, so we
-  # pick them whenever they're present. Among modern tags we prefer real
-  # releases over pre-releases (so a SHA in both v1.20.0-rc.2 and v1.20.1 is
-  # reported as v1.20.1, matching the public release).
+  # pick them whenever they're present. For modern tags, whether pre-releases
+  # count as "shipped" depends on the platform: hex/elixir/gleam GHSAs cover
+  # pre-releases (semver ecosystem norm), so a SHA in both v1.6.0-rc.0 and
+  # v1.6.17 is reported as v1.6.0-rc.0. OTP does not consider RCs stable, so
+  # pre-release tags are skipped and the earliest real release wins.
   defp earliest_tag(cfg, sha) do
     tags = tags_containing(cfg, sha)
     if tags == [], do: halt_fail("error: no release tag in #{cfg.repo} contains #{sha}")
 
     legacy = Enum.filter(tags, fn {kind, _, _} -> kind == :legacy end)
     modern = Enum.filter(tags, fn {kind, _, _} -> kind == :modern end)
-    modern_release = Enum.filter(modern, fn {_, _, v} -> not pre_release?(v) end)
+
+    modern_candidates =
+      if cfg.pre_releases_are_stable,
+        do: modern,
+        else: Enum.filter(modern, fn {_, _, v} -> not pre_release?(v) end)
 
     cond do
       legacy != [] ->
         {_, name, _} = Enum.min_by(legacy, fn {_, _, v} -> v end)
         name
 
-      modern_release != [] ->
-        {_, name, _} = Enum.min_by(modern_release, fn {_, _, v} -> parse_version(v) end)
+      modern_candidates != [] ->
+        {_, name, _} = Enum.min_by(modern_candidates, fn {_, _, v} -> parse_version(v) end)
         name
 
       true ->
+        # Fallback: only pre-release tags exist and the platform excludes
+        # them. Report the earliest pre-release rather than failing.
         {_, name, _} = Enum.min_by(modern, fn {_, _, v} -> parse_version(v) end)
         name
     end
@@ -202,6 +342,19 @@ defmodule GenAffected do
     end
   end
 
+  # ---- platform: hex ---------------------------------------------------------
+  # Hex packages are semver, possibly with a leading "v" on tags. Group key
+  # uses {major, minor} so backports across release lines stay separable.
+  defp hex_minor(tag) do
+    bare = String.replace_prefix(tag, "v", "")
+
+    case parse_version(bare) |> elem(0) do
+      [maj, min | _] -> {maj, min}
+      [maj] -> {maj, 0}
+      _ -> nil
+    end
+  end
+
   # ---- app version resolver (otp_versions.table for Erlang, identity for Elixir)
   # Returns the app's version in a given release tag.
   defp app_version(:otp_versions_table, tag, app) do
@@ -275,43 +428,54 @@ defmodule GenAffected do
     end)
   end
 
-  defp per_major_entries(cfg, fixes, intro_tag) do
-    if fixes == [] do
-      case cfg.todo_no_fixes do
-        :latest_3_majors ->
-          intro_key = cfg.group_key.(intro_tag)
+  defp per_major_entries(cfg, fixes, intro_tag, no_patch?) do
+    cond do
+      no_patch? ->
+        # No patch will ever ship: a single open-ended range from intro forward.
+        intro_key = cfg.group_key.(intro_tag)
+        [%{key: intro_key, no_fix: true}]
 
-          # For Erlang, group_key returns the major int. Filter to majors >= intro_major.
-          case System.cmd(script("otp-versions"), ["list-releases"], stderr_to_stdout: true) do
-            {out, 0} ->
-              out
-              |> String.split("\n", trim: true)
-              |> Enum.map(&cfg.group_key.(&1))
-              |> Enum.uniq()
-              |> Enum.filter(fn k -> intro_key == nil or k >= intro_key end)
-              |> Enum.take(3)
-              |> Enum.map(fn k ->
-                %{key: k, fix_tag: "TODO#{k}", fix_sha: "TODO#{k}", todo: true}
-              end)
+      fixes == [] ->
+        todo_entries(cfg, intro_tag)
 
-            _ ->
-              halt_fail("error: otp-versions list-releases failed")
-          end
+      true ->
+        resolve_fixes(cfg, fixes)
+        |> Enum.sort_by(fn {k, _} -> sort_neg(k) end)
+        |> Enum.map(fn {key, {fix_tag, fix_sha}} ->
+          %{key: key, fix_tag: fix_tag, fix_sha: fix_sha, todo: false, no_fix: false}
+        end)
+    end
+  end
 
-        :single_todo ->
-          # Elixir: a single TODO slot keyed by intro's minor (we can't predict
-          # which minor will receive the fix).
-          intro_key = cfg.group_key.(intro_tag)
-          label = "TODO"
+  defp todo_entries(cfg, intro_tag) do
+    case cfg.todo_no_fixes do
+      :latest_3_majors ->
+        intro_key = cfg.group_key.(intro_tag)
 
-          [%{key: intro_key, fix_tag: label, fix_sha: label, todo: true}]
-      end
-    else
-      resolve_fixes(cfg, fixes)
-      |> Enum.sort_by(fn {k, _} -> sort_neg(k) end)
-      |> Enum.map(fn {key, {fix_tag, fix_sha}} ->
-        %{key: key, fix_tag: fix_tag, fix_sha: fix_sha, todo: false}
-      end)
+        # For Erlang, group_key returns the major int. Filter to majors >= intro_major.
+        case System.cmd(script("otp-versions"), ["list-releases"], stderr_to_stdout: true) do
+          {out, 0} ->
+            out
+            |> String.split("\n", trim: true)
+            |> Enum.map(&cfg.group_key.(&1))
+            |> Enum.uniq()
+            |> Enum.filter(fn k -> intro_key == nil or k >= intro_key end)
+            |> Enum.take(3)
+            |> Enum.map(fn k ->
+              %{key: k, fix_tag: "TODO#{k}", fix_sha: "TODO#{k}", todo: true, no_fix: false}
+            end)
+
+          _ ->
+            halt_fail("error: otp-versions list-releases failed")
+        end
+
+      :single_todo ->
+        # Elixir: a single TODO slot keyed by intro's minor (we can't predict
+        # which minor will receive the fix).
+        intro_key = cfg.group_key.(intro_tag)
+        label = "TODO"
+
+        [%{key: intro_key, fix_tag: label, fix_sha: label, todo: true, no_fix: false}]
     end
   end
 
@@ -327,6 +491,14 @@ defmodule GenAffected do
 
     otp_version =
       case per_major do
+        [%{no_fix: true}] ->
+          %{
+            "lessThan" => "*",
+            "status" => "affected",
+            "version" => intro_version,
+            "versionType" => cfg.version_type
+          }
+
         [%{fix_tag: tag, todo: todo}] ->
           %{
             "lessThan" => if(todo, do: tag, else: strip_prefix(cfg, tag)),
@@ -350,6 +522,14 @@ defmodule GenAffected do
 
     git_version =
       case per_major do
+        [%{no_fix: true}] ->
+          %{
+            "lessThan" => "*",
+            "status" => "affected",
+            "version" => intro_sha,
+            "versionType" => "git"
+          }
+
         [%{fix_sha: sha}] ->
           %{
             "lessThan" => sha,
@@ -368,6 +548,12 @@ defmodule GenAffected do
           }
       end
 
+    versions =
+      case cfg.github_versions do
+        :git_only -> [git_version]
+        :otp_and_git -> [otp_version, git_version]
+      end
+
     base_entry(paths, modules, routines)
     |> Map.merge(%{
       "collectionURL" => "https://github.com",
@@ -377,7 +563,7 @@ defmodule GenAffected do
       "product" => cfg.product,
       "repo" => cfg.repo_url,
       "vendor" => cfg.vendor,
-      "versions" => [otp_version, git_version]
+      "versions" => versions
     })
   end
 
@@ -386,6 +572,11 @@ defmodule GenAffected do
 
     versions =
       case per_major do
+        [%{no_fix: true}] ->
+          [%{"lessThan" => "*",
+             "status" => "affected", "version" => intro_app_version,
+             "versionType" => cfg.version_type}]
+
         [%{todo: true, key: k}] ->
           [%{"lessThan" => "TODO#{format_key(k)}",
              "status" => "affected", "version" => intro_app_version,
@@ -416,13 +607,12 @@ defmodule GenAffected do
     base_entry(relative_paths, modules, routines)
     |> Map.merge(%{
       "cpes" => [cfg.cpe],
-      "packageName" => app,
-      "packageURL" => "pkg:otp/#{app}?repository_url=#{cfg.package_repo_url}&vcs_url=#{cfg.package_vcs_url}",
       "product" => cfg.product,
       "repo" => cfg.repo_url,
       "vendor" => cfg.vendor,
       "versions" => versions
     })
+    |> Map.merge(cfg.app_entry_extras.(app))
   end
 
   defp format_key(k) when is_integer(k), do: "#{k}"
@@ -461,8 +651,12 @@ defmodule GenAffected do
       Enum.map_reduce(sorted, nil, fn m, prev ->
         match = %{"criteria" => cfg.cpe, "vulnerable" => true}
 
-        end_excl = if m.todo, do: "TODO#{format_key(m.key)}", else: strip_prefix(cfg, m.fix_tag)
-        match = Map.put(match, "versionEndExcluding", end_excl)
+        match =
+          cond do
+            m.no_fix -> match
+            m.todo -> Map.put(match, "versionEndExcluding", "TODO#{format_key(m.key)}")
+            true -> Map.put(match, "versionEndExcluding", strip_prefix(cfg, m.fix_tag))
+          end
 
         match =
           cond do
@@ -496,24 +690,155 @@ defmodule GenAffected do
     fixes = opts.fixes
     modules = opts.modules
     routines = opts.routines
+    no_patch? = opts.no_patch?
+
+    if no_patch? and fixes != [] do
+      halt_fail("error: --no-patch-will-be-provided is incompatible with --fix")
+    end
+
+    intro_tag = earliest_tag(cfg, intro)
+    per_major = per_major_entries(cfg, fixes, intro_tag, no_patch?)
+
+    ctx = %{
+      cfg: cfg,
+      intro_sha: intro,
+      intro_tag: intro_tag,
+      per_major: per_major,
+      paths: paths,
+      modules: modules,
+      routines: routines
+    }
+
+    %{
+      "affected" => cfg.build_entries.(ctx),
+      "cpeApplicability" => [build_cpe_applicability(cfg, intro_tag, per_major)]
+    }
+  end
+
+  # Default for erlang/elixir/hex: one entry per affected app + a github entry.
+  defp default_build_entries(ctx) do
+    %{cfg: cfg, intro_tag: intro_tag, per_major: per_major, paths: paths,
+      modules: modules, routines: routines} = ctx
 
     paths_by_app = Enum.group_by(paths, cfg.path_to_app)
     apps = Map.keys(paths_by_app) |> Enum.sort()
-
-    intro_tag = earliest_tag(cfg, intro)
-    per_major = per_major_entries(cfg, fixes, intro_tag)
-
-    github_entry = build_github_entry(cfg, intro, intro_tag, per_major, paths, modules, routines)
 
     app_entries =
       Enum.map(apps, fn app ->
         build_app_entry(cfg, app, intro_tag, per_major, paths_by_app[app], modules, routines)
       end)
 
-    %{
-      "affected" => app_entries ++ [github_entry],
-      "cpeApplicability" => [build_cpe_applicability(cfg, intro_tag, per_major)]
-    }
+    github_entry =
+      build_github_entry(cfg, ctx.intro_sha, intro_tag, per_major, paths, modules, routines)
+
+    app_entries ++ [github_entry]
+  end
+
+  # Gleam compiler: sid entry (gleam.run) + github entry + oci entry.
+  # The OCI image is published with a fixed matrix of variant tags; the
+  # github entry stays git-only (we already have semver on the sid entry).
+  defp gleam_build_entries(ctx) do
+    %{cfg: cfg, intro_tag: intro_tag, per_major: per_major, paths: paths,
+      modules: modules, routines: routines} = ctx
+
+    sid_entry = build_gleam_sid_entry(cfg, intro_tag, per_major, paths, modules, routines)
+
+    github_entry =
+      build_github_entry(cfg, ctx.intro_sha, intro_tag, per_major, paths, modules, routines)
+
+    oci_entry = build_gleam_oci_entry(cfg, intro_tag, per_major, paths, modules, routines)
+
+    [sid_entry, github_entry, oci_entry]
+  end
+
+  # Fixed OCI tag variants published by the gleam-lang CI matrix. The image
+  # tag is `v<semver>-<variant>`, generated per release for every variant.
+  @gleam_oci_variants ~w(elixir erlang node elixir-slim erlang-slim node-slim
+                         elixir-alpine erlang-alpine node-alpine scratch)
+
+  defp build_gleam_sid_entry(cfg, intro_tag, per_major, paths, modules, routines) do
+    intro_version = strip_prefix(cfg, intro_tag)
+
+    versions =
+      case per_major do
+        [%{no_fix: true}] ->
+          [%{"lessThan" => "*", "status" => "affected",
+             "version" => intro_version, "versionType" => cfg.version_type}]
+
+        [%{todo: true, key: k}] ->
+          [%{"lessThan" => "TODO#{format_key(k)}", "status" => "affected",
+             "version" => intro_version, "versionType" => cfg.version_type}]
+
+        [%{todo: false, fix_tag: tag}] ->
+          [%{"lessThan" => strip_prefix(cfg, tag), "status" => "affected",
+             "version" => intro_version, "versionType" => cfg.version_type}]
+
+        _ ->
+          changes =
+            Enum.map(per_major, fn m ->
+              at = if m.todo, do: "TODO#{format_key(m.key)}", else: strip_prefix(cfg, m.fix_tag)
+              %{"at" => at, "status" => "unaffected"}
+            end)
+
+          [%{"changes" => changes, "lessThan" => "*", "status" => "affected",
+             "version" => intro_version, "versionType" => cfg.version_type}]
+      end
+
+    base_entry(paths, modules, routines)
+    |> Map.merge(%{
+      "cpes" => [cfg.cpe],
+      "packageName" => "gleam",
+      "packageURL" => sid_gleam_purl(),
+      "product" => cfg.product,
+      "vendor" => cfg.vendor,
+      "versions" => versions
+    })
+  end
+
+  defp build_gleam_oci_entry(cfg, intro_tag, per_major, paths, modules, routines) do
+    intro_version = strip_prefix(cfg, intro_tag)
+
+    versions =
+      Enum.flat_map(@gleam_oci_variants, fn variant ->
+        case per_major do
+          [%{no_fix: true}] ->
+            [%{"lessThan" => "*", "status" => "affected",
+               "version" => "v#{intro_version}-#{variant}", "versionType" => "other"}]
+
+          [%{todo: true, key: k}] ->
+            [%{"lessThan" => "TODO#{format_key(k)}-#{variant}", "status" => "affected",
+               "version" => "v#{intro_version}-#{variant}", "versionType" => "other"}]
+
+          [%{todo: false, fix_tag: tag}] ->
+            [%{"lessThan" => "v#{strip_prefix(cfg, tag)}-#{variant}", "status" => "affected",
+               "version" => "v#{intro_version}-#{variant}", "versionType" => "other"}]
+
+          _ ->
+            changes =
+              Enum.map(per_major, fn m ->
+                at =
+                  if m.todo,
+                    do: "TODO#{format_key(m.key)}-#{variant}",
+                    else: "v#{strip_prefix(cfg, m.fix_tag)}-#{variant}"
+
+                %{"at" => at, "status" => "unaffected"}
+              end)
+
+            [%{"changes" => changes, "lessThan" => "*", "status" => "affected",
+               "version" => "v#{intro_version}-#{variant}", "versionType" => "other"}]
+        end
+      end)
+
+    base_entry(paths, modules, routines)
+    |> Map.merge(%{
+      "collectionURL" => "https://ghcr.io",
+      "cpes" => [cfg.cpe],
+      "packageName" => "gleam-lang/gleam",
+      "packageURL" => oci_gleam_purl(),
+      "product" => cfg.product,
+      "vendor" => cfg.vendor,
+      "versions" => versions
+    })
   end
 
   # ---- arg parsing -----------------------------------------------------------
@@ -526,6 +851,9 @@ defmodule GenAffected do
           path: :keep,
           module: :keep,
           routine: :keep,
+          package: :string,
+          repo: :string,
+          no_patch_will_be_provided: :boolean,
           help: :boolean
         ],
         aliases: [h: :help]
@@ -540,6 +868,9 @@ defmodule GenAffected do
       paths: Keyword.get_values(opts, :path),
       modules: Keyword.get_values(opts, :module),
       routines: Keyword.get_values(opts, :routine),
+      package: Keyword.get(opts, :package),
+      repo: Keyword.get(opts, :repo),
+      no_patch?: Keyword.get(opts, :no_patch_will_be_provided, false),
       rest: rest
     }
   end
@@ -550,19 +881,41 @@ defmodule GenAffected do
       gen-affected <erlang|elixir> --intro <SHA> [--fix <SHA>]...
                                    --path <path> [--path ...]
                                    [--module <name>]... [--routine <module:fun/arity>]...
+                                   [--no-patch-will-be-provided]
+
+      gen-affected hex --package <name> --repo <github-url>
+                       --intro <SHA> [--fix <SHA>]...
+                       --path <path> [--path ...]
+                       [--module <name>]... [--routine <module:fun/arity>]...
+                       [--no-patch-will-be-provided]
+
+      gen-affected gleam --intro <SHA> [--fix <SHA>]...
+                         --path <path> [--path ...]
+                         [--module <crate>]... [--routine <crate::fn>]...
+                         [--no-patch-will-be-provided]
+
+    --no-patch-will-be-provided emits open-ended ranges (lessThan "*", no
+    versionEndExcluding) for advisories where no patch will ever ship (e.g.
+    a retired/deprecated package). Cannot be combined with --fix.
+
+    The gleam subcommand emits three affected entries (pkg:sid/gleam.run/gleam,
+    pkg:github/gleam-lang/gleam, pkg:oci/gleam) and generates the OCI image
+    variant matrix (elixir, erlang, node, *-slim, *-alpine, scratch).
     """)
   end
 
   def main(["erlang" | rest]), do: dispatch(:erlang, rest)
   def main(["elixir" | rest]), do: dispatch(:elixir, rest)
+  def main(["hex" | rest]), do: dispatch(:hex, rest)
+  def main(["gleam" | rest]), do: dispatch(:gleam, rest)
   def main(["--help"]), do: (usage(); System.halt(0))
   def main(["-h"]), do: (usage(); System.halt(0))
   def main([]), do: (usage(); System.halt(1))
-  def main([cmd | _]), do: halt_fail("error: unknown subcommand #{inspect(cmd)} (supported: erlang, elixir)")
+  def main([cmd | _]), do: halt_fail("error: unknown subcommand #{inspect(cmd)} (supported: erlang, elixir, hex, gleam)")
 
   defp dispatch(platform, args) do
     opts = parse_args(args)
-    result = run(config(platform), opts)
+    result = run(config(platform, opts), opts)
     IO.puts(format_json(result))
   end
 

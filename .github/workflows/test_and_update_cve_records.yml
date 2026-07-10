@@ -39,8 +39,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: './scripts/generate-reservations-lock'
       - name: CVE RSUS check and upload
-        # TODO: Switch back to upstream once PRs are merged
-        uses: erlef-cna/cna-bot@main
+        uses: DIVD-NL/cna-bot@577a08d0f1cf420e9afea2b26222a1f1e9726037 # v1.8.0
         with:
           cve-user: ${{ secrets.CVE_USER }}
           cve-org: ${{ secrets.CVE_ORG }}
