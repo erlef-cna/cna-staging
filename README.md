@@ -1,5 +1,7 @@
 # Erlang Ecosystem Foundation CNA Staging Repository
 
+> **Note:** This repository has been superseded by [Varsel](https://github.com/erlef-cna/varsel), our new CVE management system.
+
 [![EEF Security WG project](https://img.shields.io/badge/EEF-Security-black)](https://github.com/erlef/security-wg)
 [![Test and Update CVE Records](https://github.com/erlef-cna/cna-staging/actions/workflows/test_and_update_cve_records.yml/badge.svg)](https://github.com/erlef-cna/cna-staging/actions/workflows/test_and_update_cve_records.yml)
 
